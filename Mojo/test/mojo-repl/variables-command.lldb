@@ -1,0 +1,23 @@
+# ===----------------------------------------------------------------------=== #
+# Copyright (c) 2026, Modular Inc. All rights reserved.
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions:
+# https://llvm.org/LICENSE.txt
+# ===----------------------------------------------------------------------=== #
+
+# RUN: %repl <%s 2>&1 | FileCheck %s
+
+var answer = 42
+
+# CHECK: (Int) answer = 42
+
+:mojo variables --format=json
+# CHECK-DAG: "name": "answer"
+# CHECK-DAG: "type": "Int"
+# CHECK-DAG: "value": "42"
+# CHECK-DAG: "has_children": false
+
+answer = 43
+
+:mojo variables --format=json
+# CHECK: "value": "43"

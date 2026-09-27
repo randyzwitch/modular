@@ -12,12 +12,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "CommandObjectMojo.h"
+#include "../ExpressionParser/MojoExpressionVariable.h"
 #include "../REPL/MojoREPL.h"
 #include "../ScriptingBridge/SBClassUtils.h"
 #include "../TypeSystem/MojoTypeSystem.h"
 #include "Support/Telemetry/Telemetry.h"
 #include "lldb/Target/Target.h"
 #include "lldb/lldb-types.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 
 using namespace M;
 using namespace M::KGEN::Mojo;
@@ -94,6 +98,64 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// CommandVariables: mojo variables --format=json
+//===----------------------------------------------------------------------===//
+class CommandVariables : public SBCommandPluginInterface {
+public:
+  bool DoExecute(SBDebugger debugger, char **command,
+                 SBCommandReturnObject &result) override {
+    SmallVector<StringRef> args;
+    for (char **it = command; it && *it; ++it)
+      args.push_back(*it);
+    if (args.size() != 1 || args[0] != "--format=json") {
+      result.SetError("expected '--format=json'");
+      return false;
+    }
+
+    auto target = SBTargetUtils::getSP(debugger.GetSelectedTarget());
+    if (!target) {
+      result.SetError("no selected target");
+      return false;
+    }
+    auto typeSystemOr =
+        target->GetScratchTypeSystemForLanguage(lldb::eLanguageTypeMojo);
+    if (!typeSystemOr) {
+      result.SetError("Mojo type system is unavailable");
+      return false;
+    }
+    auto *typeSystem = static_cast<MojoTypeSystem *>(typeSystemOr->get());
+    auto *state = static_cast<MojoPersistentExpressionState *>(
+        typeSystem->GetPersistentExpressionState());
+
+    llvm::json::Array variables;
+    DenseSet<lldb_private::ConstString> names;
+    for (int i = state->GetSize() - 1; i >= 0; --i) {
+      lldb::ExpressionVariableSP variable = state->GetVariableAtIndex(i);
+      if (!variable || !names.insert(variable->GetName()).second)
+        continue;
+
+      SBValue value = SBValueUtils::create(variable->m_frozen_sp);
+      const char *type = value.GetDisplayTypeName();
+      const char *summary = value.GetSummary();
+      const char *rawValue = value.GetValue();
+      variables.emplace_back(llvm::json::Object{
+          {"name", variable->GetName().GetStringRef()},
+          {"type", type ? type : ""},
+          {"value", summary ? summary : (rawValue ? rawValue : "")},
+          {"has_children", value.GetNumChildren() != 0},
+      });
+    }
+
+    std::string output;
+    llvm::raw_string_ostream stream(output);
+    stream << llvm::formatv("{0:2}", llvm::json::Value(std::move(variables)));
+    result.AppendMessage(output.c_str());
+    result.SetStatus(lldb::eReturnStatusSuccessFinishResult);
+    return true;
+  }
+};
+
+//===----------------------------------------------------------------------===//
 // CommandStats: mojo stats
 //
 // Telemetry subcommand:
@@ -150,6 +212,9 @@ void M::KGEN::Mojo::registerMojoCommands(SBDebugger debugger,
                   "current selected target. If no arguments are specified, "
                   "this feature will be enabled.",
                   "mojo break-on-raise ([enable|disable])");
+  root.AddCommand("variables", new CommandVariables(),
+                  "List persistent Mojo REPL variables as JSON.",
+                  "mojo variables --format=json");
   root.AddCommand("statistics", new CommandStats(getContext),
                   "Internal commands related to statistics of Mojo");
 
