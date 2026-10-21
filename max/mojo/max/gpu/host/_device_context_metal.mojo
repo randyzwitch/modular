@@ -91,7 +91,6 @@ struct MetalDeviceTypeEncoder(DeviceTypeEncoder):
 
 
 @inline(.always)
-@__parameter
 def call_with_pack_metal[
     func: Some[TrivialRegisterPassable],
     ContextT: _FunctionEnqueuer,
@@ -162,7 +161,7 @@ def call_with_pack_metal[
     var dense_args_is_device_ptr: Pointer[Bool, MutUntrackedOrigin]
     if num_captures > num_captures_static:
         dense_args_is_device_ptr = alloc(
-            Layout[Bool](count=num_captures + num_args)
+            Layout[Bool](length=num_captures + num_args)
         ).unsafe_leak()
         for i in range(num_captures + num_args):
             dense_args_is_device_ptr[unsafe_offset=i] = False
@@ -204,26 +203,23 @@ def call_with_pack_metal[
         dealloc(
             ThinAllocation(
                 unsafe_owned_ptr=dense_args_is_device_ptr
-            ).unsafe_with_layout({count = num_captures + num_args})
+            ).unsafe_with_layout({length = num_captures + num_args})
         )
 
 
 @inline(.always)
-@__parameter
 def call_with_pack_checked_metal[
+    HostArgs: TypeList[Trait=RegisterPassable, ...],
+    //,
     func: Some[TrivialRegisterPassable],
     *Ts: DevicePassable,
     ContextT: _FunctionEnqueuer,
     num_passed_args: Int,
     num_captures_static: Int,
-    extra_host_count: Int = 0,
 ](
     ctx: ContextT,
     *args: *Ts,
-    host0: Optional[OpaquePointer[MutAnyOrigin]] = None,
-    host1: Optional[OpaquePointer[MutAnyOrigin]] = None,
-    host0_size: Int = 0,
-    host1_size: Int = 0,
+    host_args: Tuple[*HostArgs],
     func_handle: _DeviceFunctionPtr[mut=True],
     device_context: DeviceContext,
     capture_sizes: Pointer[UInt64, ImmUntrackedOrigin],
@@ -249,15 +245,11 @@ def call_with_pack_checked_metal[
         num_passed_args: The compile-time count of arguments in `args`.
         num_captures_static: The static capture-count threshold for stack
             allocation. Heap allocation is used when `num_captures` exceeds it.
-        extra_host_count: Host-layout arguments appended after `args`.
 
     Args:
         ctx: The enqueuer that dispatches the kernel.
         args: The host-side kernel arguments to encode.
-        host0: Pointer to the first host-layout argument, or `None`.
-        host1: Pointer to the second host-layout argument, or `None`.
-        host0_size: Byte size of the first host-layout argument.
-        host1_size: Byte size of the second host-layout argument.
+        host_args: Pack of host-layout arguments to encode.
         func_handle: Handle to the compiled `DeviceFunction` to launch.
         device_context: The device context backing the function, used for
             error reporting in `_checked_call`.
@@ -280,6 +272,8 @@ def call_with_pack_checked_metal[
         location: Source location threaded through `_checked_call` for error
             messages.
     """
+    comptime extra_host_count = host_args.Ts.length
+
     # Stack-allocated backing storage for the small-capture path. Using
     # `Array` (rather than `unsafe_stack_allocation`) gives the compiler a
     # named local whose origin flows into the `MetalEnqueueFunctionArgs`
@@ -298,12 +292,12 @@ def call_with_pack_checked_metal[
     if num_captures > num_captures_static:
         dense_args_sizes = alloc(
             Layout[UInt64](
-                count=num_captures + num_passed_args + extra_host_count
+                length=num_captures + num_passed_args + extra_host_count
             )
         ).unsafe_leak()
         dense_args_is_device_ptr = alloc(
             Layout[Bool](
-                count=num_captures + num_passed_args + extra_host_count
+                length=num_captures + num_passed_args + extra_host_count
             )
         ).unsafe_leak()
         for i in range(num_captures + num_passed_args + extra_host_count):
@@ -330,45 +324,50 @@ def call_with_pack_checked_metal[
         # If the arg offset is negative then the corresponding declared
         # dtype is zero sized and we do not push the argument to the kernel.
         var translated_arg_offset = translated_arg_offsets[i]
-        if translated_arg_offset >= 0:
-            comptime actual_arg_type = Ts[i]
-            var first_word_addr = Pointer(
-                to=translated_args_ptr[
-                    unsafe_offset=translated_arg_offset + extra_align
-                ]
-            ).unsafe_bitcast[NoneType]()
-            # Snapshot the encoder's buffer count so we can detect
-            # whether this arg's encoding pushed exactly one device
-            # buffer. Combined with the pointer-sized arg check
-            # below, this distinguishes a bare `DevicePointer` /
-            # `DeviceBuffer` arg from a nested struct that happens
-            # to contain one or more device pointers.
-            var buffers_before = len(device_type_encoder._buffers)
-            args[i]._to_device_type(device_type_encoder, first_word_addr)
+        if translated_arg_offset < 0:
+            continue
 
-            var arg_size = size_of[
-                actual_arg_type.device_type,
-                target=device_type_encoder.target(),
-            ]()
-            dense_args_addrs[unsafe_offset=translated_arg_idx] = first_word_addr
-            dense_args_sizes[unsafe_offset=translated_arg_idx] = UInt64(
-                arg_size
-            )
-            dense_args_is_device_ptr[unsafe_offset=translated_arg_idx] = (
-                len(device_type_encoder._buffers) - buffers_before == 1
-                and arg_size == size_of[OpaquePointer[MutAnyOrigin]]()
-            )
-            translated_arg_idx += 1
+        comptime actual_arg_type = Ts[i]
+        var first_word_addr = Pointer(
+            to=translated_args_ptr[
+                unsafe_offset=translated_arg_offset + extra_align
+            ]
+        ).unsafe_bitcast[NoneType]()
+        # Snapshot the encoder's buffer count so we can detect
+        # whether this arg's encoding pushed exactly one device
+        # buffer. Combined with the pointer-sized arg check
+        # below, this distinguishes a bare `DevicePointer` /
+        # `DeviceBuffer` arg from a nested struct that happens
+        # to contain one or more device pointers.
+        var buffers_before = len(device_type_encoder._buffers)
+        args[i]._to_device_type(device_type_encoder, first_word_addr)
 
-    if extra_host_count >= 1 and host0:
-        dense_args_addrs[unsafe_offset=translated_arg_idx] = host0.value()
-        dense_args_sizes[unsafe_offset=translated_arg_idx] = UInt64(host0_size)
-        dense_args_is_device_ptr[unsafe_offset=translated_arg_idx] = False
+        var arg_size = size_of[
+            actual_arg_type.device_type,
+            target=device_type_encoder.target(),
+        ]()
+        dense_args_addrs[unsafe_offset=translated_arg_idx] = first_word_addr
+        dense_args_sizes[unsafe_offset=translated_arg_idx] = UInt64(arg_size)
+        dense_args_is_device_ptr[unsafe_offset=translated_arg_idx] = (
+            len(device_type_encoder._buffers) - buffers_before == 1
+            and arg_size == size_of[OpaquePointer[MutAnyOrigin]]()
+        )
         translated_arg_idx += 1
-    if extra_host_count >= 2 and host1:
-        dense_args_addrs[unsafe_offset=translated_arg_idx] = host1.value()
-        dense_args_sizes[unsafe_offset=translated_arg_idx] = UInt64(host1_size)
-        dense_args_is_device_ptr[unsafe_offset=translated_arg_idx] = False
+
+    comptime for i in range(extra_host_count):
+        comptime arg_size = size_of[host_args.Ts[i], device_context.target]()
+        # Skip zero-sized types (ZSTs).
+        if arg_size == 0:
+            continue
+
+        var arg_addr = (
+            Pointer(to=host_args[i])
+            .unsafe_bitcast[NoneType]()
+            .unsafe_mut_cast[True]()
+            .as_unsafe_any_origin()
+        )
+        dense_args_addrs[unsafe_offset=translated_arg_idx] = arg_addr
+        dense_args_sizes[unsafe_offset=translated_arg_idx] = UInt64(arg_size)
         translated_arg_idx += 1
 
     # Drop zero-sized captures so the packed slots (and their sizes) match the
@@ -429,13 +428,13 @@ def call_with_pack_checked_metal[
             ThinAllocation(
                 unsafe_owned_ptr=dense_args_sizes
             ).unsafe_with_layout(
-                {count = num_captures + num_passed_args + extra_host_count}
+                {length = num_captures + num_passed_args + extra_host_count}
             )
         )
         dealloc(
             ThinAllocation(
                 unsafe_owned_ptr=dense_args_is_device_ptr
             ).unsafe_with_layout(
-                {count = num_captures + num_passed_args + extra_host_count}
+                {length = num_captures + num_passed_args + extra_host_count}
             )
         )

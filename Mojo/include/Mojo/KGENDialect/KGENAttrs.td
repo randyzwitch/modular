@@ -524,6 +524,13 @@ def KGEN_QuoteAttr : KGEN_ExprAttr<"Quote", "quote",
 
     // A quote is a "deferred scope"
     ArrayRef<Type> getInputParamTypes() { return {};}
+
+    /// Returns the quoted parameter if `value` is a quote, otherwise `value`.
+    static TypedAttr unquote(TypedAttr value) {
+      if (auto quoted = ::llvm::dyn_cast_or_null<QuoteAttr>(value))
+        return quoted.getQuotedParam();
+      return value;
+    }
   }];
 }
 
@@ -597,20 +604,17 @@ def KGEN_TypeConformToTraitAttr : KGENAttr<"TypeConformsToTrait", "type_conforms
   let summary = "check whether the checked types conform to specific traits";
   let description = [{
     This represents a flag to indicate that every type in `typeValue` conforms
-    to the specified traits. The stored checked operand is normalized to a
-    `param_list<!kgen.type>` value.
+    to the specified traits. `get` normalizes the checked operand: it strips an
+    outer upcast, folds an empty pack to `True`, unwraps a one-element pack,
+    and splits a wider pack into an AND of single conformances.
 
     Example:
 
     ```mlir
     #kgen.type_conforms_to_trait<
-        #kgen.param_list<#kgen.param.decl.ref<"T"> : !kgen.type>,
+        #kgen.param.decl.ref<"T"> : !kgen.type,
         #kgen.type<typevalue<#kgen.trait_ref<[@Movable, @Copyable]>>, type> : !kgen.type>
     ```
-
-    For the common case of a single checked type value, the operand is printed
-    in sugared form: the 1-element `param_list` literal (and any outer upcast
-    that simply retypes its element to `!kgen.type`) is stripped.
   }];
 
   let assemblyFormat =
@@ -2143,44 +2147,42 @@ def KGEN_TargetParamAttr : KGEN_ExprAttr<"TargetParam", "target"> {
 //===----------------------------------------------------------------------===//
 
 def KGEN_GetTargetPluginAttr : KGEN_ExprAttr<"GetTargetPlugin",
-    "get_target_plugin"> {
-  let summary = "Get the opaque plugin payload carried by a target.";
+    "get_target_plugin",
+    [DeclareAttrInterfaceMethods<ContextuallyEvaluatedAttrInterface,
+                                 ["evaluateWithContext"]>]> {
+  let summary = "Get a target's opaque plugin payload or a fallback.";
   let description = [{
-    The `#kgen.get_target_plugin` attribute returns the `opaque_plugin` payload
-    of a target if the plugin type matches the requested type.
-
-    Example:
-
-    ```mlir
-    kgen.generator @plugin_for<t0: target>() {
-      kgen.param.constant: !kgen.param_list<!kgen.type> =
-        <#kgen.get_target_plugin<t0> : !kgen.param_list<!kgen.type>>
-      hlcf.return
-    }
-    ```
+    The `#kgen.get_target_plugin` attribute returns the `opaque_plugin`
+    payload of a target if the plugin type matches the requested type. If a
+    concrete target has no payload, it returns the fallback value. It remains
+    unresolved for a target parameter. A payload whose type differs from the
+    requested type is a parse error, unless either type still mentions
+    parameters, in which case it also remains unresolved.
   }];
 
   let parameters = (ins
     "TypedAttr":$target,
+    "TypedAttr":$fallback,
     AttributeSelfTypeParameter<"", "Type">:$type
   );
 
   let assemblyFormat = [{
-    `<` custom<ParamValue>($target, "TargetType::get($_ctxt)") `>`
+    `<` custom<ParamValue>($target, "TargetType::get($_ctxt)") `,`
+        custom<ColonTypeParamValue>($fallback) `>`
   }];
 
   let builders = [
-    // Override the default builder used by the generated parser because this
-    // may not return a GetTargetPluginAttr.
     AttrBuilderWithInferredContext<(ins
-      "TypedAttr":$target, "Type":$type), "", "TypedAttr">,
+      "TypedAttr":$target, "TypedAttr":$fallback, "Type":$type), "", "TypedAttr">,
 
-    // Verbose form with MLIRContext, needed for ODS constructors.
-    AttrBuilder<(ins "TypedAttr":$target, "Type":$type), [{
-      return get(target, type);
-    }], "TypedAttr">,
+    // Verbose form with MLIRContext, needed for ODS constructors. Defined by
+    // hand so that the checked form can diagnose a mismatched payload type.
+    AttrBuilder<(ins
+      "TypedAttr":$target, "TypedAttr":$fallback, "Type":$type), "",
+      "TypedAttr">,
   ];
 
+  let genVerifyDecl = 1;
   let skipDefaultBuilders = 1;
 }
 
@@ -2468,6 +2470,18 @@ def KGEN_ParamOperatorAttr : KGEN_ExprAttr<"ParamOperator", "param.expr", [
     /// Return (not x) which is the same as (xor x, true).  The `operand` value
     /// must have type `i1`.
     static TypedAttr getNot(TypedAttr operand);
+
+    /// Return logical AND of two `!kgen.scalar<bool>` attrs, matching comptime
+    /// `and` lowering: `cond(a, b, a)`.
+    static TypedAttr getLogicalAnd(TypedAttr lhs, TypedAttr rhs) {
+      return get(POC::Cond, {lhs, rhs, lhs});
+    }
+
+    /// Return logical OR of two `!kgen.scalar<bool>` attrs, matching comptime
+    /// `or` lowering: `cond(a, a, b)`.
+    static TypedAttr getLogicalOr(TypedAttr lhs, TypedAttr rhs) {
+      return get(POC::Cond, {lhs, lhs, rhs});
+    }
 
     /// Return (neg x) which is the same as (mul x, -1).  The `operand` value
     /// must have `index` type.

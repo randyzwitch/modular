@@ -17,7 +17,7 @@ from max.gpu.host import DeviceContext
 from max.gpu.memory import CacheOperation
 from max.gpu.sync import s_waitcnt
 from max.gpu.intrinsics import AMDBufferResource
-from std.memory import AddressSpace, unsafe_stack_allocation
+from std.memory import unsafe_stack_allocation
 from std.testing import assert_equal
 
 from structured_kernels.amd_tile_io import _load_from_lds, _load_to_lds
@@ -46,7 +46,7 @@ def _copy_through_lds[
         smem,
     )
     s_waitcnt[vmcnt=0]()
-    var values = _load_from_lds[width=width](smem + offset)
+    var values = _load_from_lds[width=width](smem.unsafe_offset(offset))
     comptime for i in range(width):
         dst[offset + i] = values[i]
 

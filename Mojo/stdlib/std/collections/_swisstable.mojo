@@ -22,11 +22,12 @@ or an h2 fingerprint (0x00-0x7F) derived from the top 7 bits of the hash.
 """
 
 from std.bit import count_trailing_zeros, next_power_of_two
-from std.hashlib import Hasher, default_hasher
+from std.hash import Hasher, default_hasher
 from std.math import ceildiv
 from std.memory import (
     alloc,
     dealloc,
+    Allocation,
     ThinAllocation,
     unsafe_memcpy,
     unsafe_memset,
@@ -213,7 +214,7 @@ struct Group(Copyable, Movable):
 struct SwissTableEntry[
     K: KeyElement,
     V: Movable,
-    H: Hasher,
+    H: Hasher & Defaultable & Deinitable,
 ](
     Copyable where conforms_to(K, Copyable) and conforms_to(V, Copyable),
     Deinitable where conforms_to(K, Deinitable) and conforms_to(V, Deinitable),
@@ -315,7 +316,7 @@ struct SwissTableEntry[
 struct SwissTable[
     K: KeyElement,
     V: Movable,
-    H: Hasher = default_hasher,
+    H: Hasher & Defaultable & Deinitable = default_hasher,
 ](
     Copyable where conforms_to(K, Copyable) and conforms_to(V, Copyable),
     Deinitable where conforms_to(K, Deinitable) and conforms_to(V, Deinitable),
@@ -389,12 +390,12 @@ struct SwissTable[
             next_power_of_two(ceildiv(capacity * 8, 7)), INITIAL_CAPACITY
         )
         self._ctrl = alloc(
-            Layout[UInt8](count=self._capacity + GROUP_WIDTH)
+            Layout[UInt8](length=self._capacity + GROUP_WIDTH)
         ).unsafe_leak()
         unsafe_memset(self._ctrl, CTRL_EMPTY, self._capacity + GROUP_WIDTH)
         self._slots = alloc(
             Layout[SwissTableEntry[Self.K, Self.V, Self.H]](
-                count=self._capacity
+                length=self._capacity
             )
         ).unsafe_leak()
         self._len = 0
@@ -417,7 +418,7 @@ struct SwissTable[
         self._growth_left = copy._growth_left
 
         self._ctrl = alloc(
-            Layout[UInt8](count=self._capacity + GROUP_WIDTH)
+            Layout[UInt8](length=self._capacity + GROUP_WIDTH)
         ).unsafe_leak()
         unsafe_memcpy(
             dest=self._ctrl,
@@ -427,7 +428,7 @@ struct SwissTable[
 
         self._slots = alloc(
             Layout[SwissTableEntry[Self.K, Self.V, Self.H]](
-                count=self._capacity
+                length=self._capacity
             )
         ).unsafe_leak()
         for i in range(self._capacity):
@@ -472,12 +473,12 @@ struct SwissTable[
         if self._capacity > 0:
             dealloc(
                 ThinAllocation(unsafe_owned_ptr=self._ctrl).unsafe_with_layout(
-                    {count = self._capacity + GROUP_WIDTH}
+                    {length = self._capacity + GROUP_WIDTH}
                 )
             )
             dealloc(
                 ThinAllocation(unsafe_owned_ptr=self._slots).unsafe_with_layout(
-                    {count = self._capacity}
+                    {length = self._capacity}
                 )
             )
 
@@ -772,11 +773,11 @@ struct SwissTable[
         var old_capacity = self._capacity
 
         self._ctrl = alloc(
-            Layout[UInt8](count=new_capacity + GROUP_WIDTH)
+            Layout[UInt8](length=new_capacity + GROUP_WIDTH)
         ).unsafe_leak()
         unsafe_memset(self._ctrl, CTRL_EMPTY, new_capacity + GROUP_WIDTH)
         self._slots = alloc(
-            Layout[SwissTableEntry[Self.K, Self.V, Self.H]](count=new_capacity)
+            Layout[SwissTableEntry[Self.K, Self.V, Self.H]](length=new_capacity)
         ).unsafe_leak()
         self._capacity = new_capacity
         self._growth_left = new_capacity * 7 // 8 - self._len
@@ -795,28 +796,28 @@ struct SwissTable[
         if old_capacity > 0:
             dealloc(
                 ThinAllocation(unsafe_owned_ptr=old_ctrl).unsafe_with_layout(
-                    {count = old_capacity + GROUP_WIDTH}
+                    {length = old_capacity + GROUP_WIDTH}
                 )
             )
             dealloc(
                 ThinAllocation(unsafe_owned_ptr=old_slots).unsafe_with_layout(
-                    {count = old_capacity}
+                    {length = old_capacity}
                 )
             )
 
         return relocations^
 
     @inline(.never)
-    def rehash_in_place(mut self) -> Pointer[Int32, MutUntrackedOrigin]:
+    def rehash_in_place(mut self) -> Allocation[Int32]:
         """Rehash in place without changing capacity (Abseil's drop-deletes).
 
         Reclaims DELETED tombstones by moving all entries to their ideal
-        probe positions. Returns a slot_map array (caller-freed) mapping
-        old slot indices to new ones.
+        probe positions. Returns a slot_map array mapping old slot indices
+        to new ones.
 
         Returns:
-            A pointer to a caller-owned Int32 array of size `_capacity`
-            mapping old_slot -> new_slot. The caller must free this.
+            An allocation holding an Int32 array of size `_capacity` mapping
+            old_slot -> new_slot. The caller must consume it with `dealloc`.
         """
         assert (
             self._len <= self._capacity * 7 // 16
@@ -836,9 +837,11 @@ struct SwissTable[
         )
 
         # Step 3: Relocate entries.
-        var slot_map = alloc(Layout[Int32](count=self._capacity)).unsafe_leak()
-        for i in range(self._capacity):
-            slot_map[unsafe_offset=i] = Int32(i)
+        var slot_map_alloc = alloc(Layout[Int32](length=self._capacity))
+        _ = slot_map_alloc.storage().unsafe_init_with(
+            lambda (i: Int) -> Int32: Int32(i)
+        )
+        var slot_map = slot_map_alloc.unsafe_ptr()
 
         for i in range(self._capacity):
             if self._ctrl[unsafe_offset=i] != CTRL_DELETED:
@@ -869,4 +872,4 @@ struct SwissTable[
         # Reset growth_left (all tombstones are now EMPTY).
         self._growth_left = self._capacity * 7 // 8 - self._len
 
-        return slot_map
+        return slot_map_alloc^

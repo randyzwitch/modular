@@ -13,7 +13,6 @@
 """Implements the `StringSpan` type and related utilities for efficient string operations."""
 
 from std.builtin.builtin_slice import ContiguousSlice
-from std.builtin.format_int import _write_int
 from std.reflection import call_location
 from std.collections import check_bounds, check_slice_bounds, Span
 from std.collections.string._unicode import (
@@ -38,7 +37,7 @@ from std.collections.string.iterators import (
     GraphemeIndicesIter,
     GraphemeSliceIter,
 )
-from std.hashlib.hasher import Hasher
+from std.hash.hasher import Hasher
 from std.format._utils import _TotalWritableBytes, _FlushingWriteBuffer
 from std.math import align_down
 from std.os import PathLike, abort
@@ -48,11 +47,7 @@ from std.sys.intrinsics import likely, unlikely
 
 from std.bit import count_trailing_zeros
 from std.bit.mask import is_negative, splat
-from std.memory import (
-    unsafe_memcmp,
-    unsafe_memcpy,
-    pack_bits,
-)
+from std.memory import unsafe_memcmp, pack_bits
 from std.python import Python, PythonObject
 from std.format._utils import _write_hex
 
@@ -971,12 +966,15 @@ struct StringSpan[origin: ImmOrigin](
         Returns:
             The string concatenated `n` times.
         """
-        var string = String()
-        var buffer = _FlushingWriteBuffer(string)
-        for _ in range(n):
-            buffer.write_string(self)
-        buffer.flush()
-        return string^
+        var length = self.byte_length()
+        if n <= 0 or length == 0:
+            return String()
+
+        var result = String(unsafe_uninit_length=n * length)
+        var bytes = result.unsafe_as_bytes_mut()
+        for i in range(n):
+            bytes[i * length : (i + 1) * length].copy_from(self.as_bytes())
+        return result^
 
     @inline(.nodebug)
     def __merge_with__[
@@ -1026,7 +1024,7 @@ struct StringSpan[origin: ImmOrigin](
         Returns:
             A c-compatible CStringSpan.
         """
-        return {unsafe_from_ptr = self.unsafe_ptr().unsafe_bitcast[Int8]()}
+        return {unsafe_from_ptr = self.unsafe_ptr().unsafe_bitcast[c_char]()}
 
     @inline(.always)
     def as_imm(self) -> Self.Immutable:
@@ -1085,10 +1083,10 @@ struct StringSpan[origin: ImmOrigin](
         return res^
 
     def _interleave(self, val: StringSpan) -> String:
-        # TODO: this may be better as:
-        # (val.byte_length() * self.count_codepoints()) + self.count_codepoints()
-        var estimated_capacity = val.byte_length() * self.byte_length()
-        var res = String(capacity_bytes=estimated_capacity)
+        var res = String(
+            capacity_bytes=val.byte_length() * self.count_codepoints()
+            + self.byte_length()
+        )
         for codepoint in self.codepoint_slices():
             res += val
             res += codepoint
@@ -2158,7 +2156,9 @@ struct StringSpan[origin: ImmOrigin](
                     str_len += is_r_n
                 else:
                     str_len -= splat(likely(is_new_line)) & char_len
-                    var is_r_n = unlikely(prev_b0 == `\r` and b0 == `\n`)
+                    var is_r_n = unlikely(
+                        prev_b0 == `\r` and b0 == `\n` and str_len == 0
+                    )
                     prev_b0 = b0
                     if is_r_n:  # the line was already appended
                         line_start = line_end
@@ -2405,14 +2405,14 @@ struct StringSpan[origin: ImmOrigin](
             fillchar.byte_length() == 1
         ), "fill char needs to be a one byte literal"
 
-        var result = String(capacity_bytes=width)
-        for _ in range(start):
-            result += fillchar
-        result += self
-
-        while result.byte_length() < width:
-            result += fillchar
-        return result
+        var length = self.byte_length()
+        var fill = fillchar.as_bytes()[0]
+        var result = String(unsafe_uninit_length=width)
+        var bytes = result.unsafe_as_bytes_mut()
+        bytes[:start].fill(fill)
+        bytes[start : start + length].copy_from(self.as_bytes())
+        bytes[start + length :].fill(fill)
+        return result^
 
     def join[
         T: Copyable & Writable,

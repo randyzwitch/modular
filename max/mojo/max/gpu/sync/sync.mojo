@@ -30,9 +30,9 @@ from std.sys._assembly import inlined_assembly
 from std.sys.info import CompilationTarget, _is_amd_cdna
 from std.sys.defines import get_defined_bool
 
-from std._gpu.intrinsics import Scope
+from max.gpu.intrinsics import Scope
 
-from std._gpu._utils import to_i32, to_llvm_shared_mem_ptr
+from max.gpu._utils import to_i32, to_llvm_shared_mem_ptr
 
 # ===-----------------------------------------------------------------------===#
 # barrier
@@ -222,32 +222,33 @@ struct AMDScheduleBarrierMask(
         Args:
             writer: The object to write to.
         """
-        if self == Self.NONE:
-            return writer.write_string("NONE")
-        elif self == Self.ALL_ALU:
-            return writer.write_string("ALL_ALU")
-        elif self == Self.VALU:
-            return writer.write_string("VALU")
-        elif self == Self.SALU:
-            return writer.write_string("SALU")
-        elif self == Self.MFMA:
-            return writer.write_string("MFMA")
-        elif self == Self.ALL_VMEM:
-            return writer.write_string("ALL_VMEM")
-        elif self == Self.VMEM_READ:
-            return writer.write_string("VMEM_READ")
-        elif self == Self.VMEM_WRITE:
-            return writer.write_string("VMEM_WRITE")
-        elif self == Self.ALL_DS:
-            return writer.write_string("ALL_DS")
-        elif self == Self.DS_READ:
-            return writer.write_string("DS_READ")
-        elif self == Self.DS_WRITE:
-            return writer.write_string("DS_WRITE")
-        elif self == Self.TRANS:
-            return writer.write_string("TRANS")
-        else:
-            abort("invalid AMDScheduleBarrierMask value")
+        match self:
+            case .NONE:
+                return writer.write_string("NONE")
+            case .ALL_ALU:
+                return writer.write_string("ALL_ALU")
+            case .VALU:
+                return writer.write_string("VALU")
+            case .SALU:
+                return writer.write_string("SALU")
+            case .MFMA:
+                return writer.write_string("MFMA")
+            case .ALL_VMEM:
+                return writer.write_string("ALL_VMEM")
+            case .VMEM_READ:
+                return writer.write_string("VMEM_READ")
+            case .VMEM_WRITE:
+                return writer.write_string("VMEM_WRITE")
+            case .ALL_DS:
+                return writer.write_string("ALL_DS")
+            case .DS_READ:
+                return writer.write_string("DS_READ")
+            case .DS_WRITE:
+                return writer.write_string("DS_WRITE")
+            case .TRANS:
+                return writer.write_string("TRANS")
+            case _:
+                abort("invalid AMDScheduleBarrierMask value")
 
     def __int__(self) -> Int:
         """Converts the `AMDScheduleBarrierMask` to an integer.
@@ -497,16 +498,19 @@ def _mbarrier_impl[
         address: Pointer to the memory barrier object location.
     """
 
-    comptime if address_space == .SHARED:
-        llvm_intrinsic["llvm.nvvm.cp.async.mbarrier.arrive.shared", NoneType](
-            address
-        )
-    elif (address_space == .GLOBAL or address_space == .GENERIC):
-        llvm_intrinsic["llvm.nvvm.cp.async.mbarrier.arrive", NoneType](
-            address.unsafe_address_space_cast[.GENERIC]()._get_kgen_pointer()
-        )
-    else:
-        comptime assert False, "invalid address space"
+    comptime match address_space:
+        case .SHARED:
+            llvm_intrinsic[
+                "llvm.nvvm.cp.async.mbarrier.arrive.shared", NoneType
+            ](address)
+        case .GLOBAL | .GENERIC:
+            llvm_intrinsic["llvm.nvvm.cp.async.mbarrier.arrive", NoneType](
+                address.unsafe_address_space_cast[
+                    .GENERIC
+                ]()._get_kgen_pointer()
+            )
+        case _:
+            comptime assert False, "invalid address space"
 
 
 @inline(.nodebug)
@@ -606,7 +610,8 @@ def mbarrier_arrive[
     """Signal thread arrival at a shared memory barrier.
 
     Records that the calling thread has reached the barrier synchronization point.
-    Only supported on NVIDIA GPUs.
+    When the last expected thread arrives, the barrier completes its current
+    phase and starts the next one. Only supported on NVIDIA GPUs.
 
     Parameters:
         type: The data type stored at the barrier location.
@@ -615,7 +620,9 @@ def mbarrier_arrive[
         shared_mem: Pointer to the shared memory barrier.
 
     Returns:
-        An integer representing the current state of the memory barrier.
+        An opaque token that identifies the barrier phase this arrival belongs
+        to. Pass it to `mbarrier_test_wait()` to check whether that phase has
+        completed.
     """
 
     comptime if is_nvidia_gpu():
@@ -636,20 +643,24 @@ def mbarrier_test_wait[
     shared_mem: Pointer[mut=True, type, _, address_space=.SHARED],
     state: Int,
 ) -> Bool:
-    """Test if all threads have arrived at the memory barrier.
+    """Test whether the barrier phase identified by a token has completed.
 
-    Non-blocking check to see if all participating threads have reached the barrier.
-    Only supported on NVIDIA GPUs.
+    Non-blocking check: it returns immediately, so call it in a loop to wait.
+    The token must come from `mbarrier_arrive()` on the same barrier, during
+    the barrier's current phase or the one immediately before it. Only
+    supported on NVIDIA GPUs.
 
     Parameters:
         type: The data type stored at the barrier location.
 
     Args:
         shared_mem: Pointer to the shared memory barrier.
-        state: Expected state of the memory barrier.
+        state: The token that `mbarrier_arrive()` returned for the phase to
+            check. Any other value, such as a thread count, is invalid.
 
     Returns:
-        True if all threads have arrived, False otherwise.
+        True if the phase identified by `state` has completed, False
+        otherwise.
     """
 
     comptime if is_nvidia_gpu():
@@ -659,7 +670,7 @@ def mbarrier_test_wait[
     else:
         CompilationTarget.unsupported_target_error[
             operation=__get_current_function_name(),
-            note="mbarrier_test_wair() is only supported when targeting NVIDIA GPUs",
+            note="mbarrier_test_wait() is only supported when targeting NVIDIA GPUs",
         ]()
 
 
@@ -763,18 +774,19 @@ def mbarrier_try_wait_parity_shared[
     phase: Int32,
     ticks: Int32,
 ):
-    """Wait for completion of a barrier phase with timeout.
+    """Block until the barrier completes the phase with the given parity.
 
-    Waits for the shared memory barrier to complete the specified phase,
-    or until the timeout period expires. Only supported on NVIDIA GPUs.
+    Repeats `mbarrier.try_wait.parity` until the phase completes, so the call
+    does not return early when `ticks` elapses. Only supported on NVIDIA GPUs.
 
     Parameters:
         type: The type of the memory barrier.
 
     Args:
         addr: Pointer to the shared memory barrier.
-        phase: Phase number to wait for.
-        ticks: Timeout period in nanoseconds.
+        phase: Parity of the phase to wait for: 0 for even phases, 1 for odd.
+        ticks: Hint, in nanoseconds, for how long each attempt may suspend the
+            thread before it checks again. It is not a timeout.
     """
 
     comptime if is_nvidia_gpu():
@@ -894,7 +906,6 @@ def cp_async_bulk_wait_group[n: Int32, read: Bool = True]():
         ```
     """
 
-    @__parameter
     def get_asm() -> String:
         comptime base = "llvm.nvvm.cp.async.bulk.wait.group"
         if read:

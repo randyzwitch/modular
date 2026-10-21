@@ -77,9 +77,11 @@ def _get_files(bazel: Path, query: str) -> set[Path]:
 _BINARY_SUFFIXES = {
     ".eot",
     ".gif",
+    ".gz",
     ".ico",
     ".jpeg",
     ".jpg",
+    ".mp4",
     ".otf",
     ".png",
     ".ttf",

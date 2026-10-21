@@ -38,12 +38,11 @@ from max.gpu.primitives.grid_controls import (
 from max.gpu.host import DeviceContext
 from max.gpu.host.info import B200
 from max.gpu.sync import mbarrier_init, mbarrier_arrive_expect_tx_relaxed
-from std.math import ceildiv, clamp
+from std.math import clamp
 from std.math.uutils import ufloordiv, uceildiv, udivmod
 from std.memory import unsafe_stack_allocation
 from std.sys._assembly import inlined_assembly
 from std.sys.defines import get_defined_bool, get_defined_int
-from std.sys.info import _has_sm_100x_or_newer, has_nvidia_gpu_accelerator
 from std.utils.coord import Coord, CoordLike, coord_to_index_list
 from std.utils.index import IndexList
 from std.utils.static_tuple import StaticTuple
@@ -65,7 +64,7 @@ comptime _PDL_LEVEL = PDLLevel.ON
 
 @inline(.nodebug)
 def _mbarrier_wait_acquire_cta(
-    mbar: Pointer[mut=True, Int64, _, address_space=.SHARED],
+    mbar: Pointer[mut=False, Int64, _, address_space=.SHARED],
     phase: UInt32,
 ):
     """Spin-waits on an mbarrier until the given phase completes, with acquire
@@ -641,9 +640,9 @@ struct _DualGridStrideKernel[
                         )
                         comptime if Self.handle_uneven_simd:
                             if Int(
-                                start_indices_0[Self.rank - 1].value()
+                                start_indices_0[Self.rank - 1]
                             ) + Self.simd_width > Int(
-                                self.shape_0[Self.rank - 1].value()
+                                self.shape_0[Self.rank - 1]
                             ):
                                 self.func_0[1](Coord(start_indices_0))
                                 var si = start_indices_0
@@ -669,9 +668,9 @@ struct _DualGridStrideKernel[
                         )
                         comptime if Self.handle_uneven_simd:
                             if Int(
-                                start_indices_1[Self.rank - 1].value()
+                                start_indices_1[Self.rank - 1]
                             ) + Self.simd_width > Int(
-                                self.shape_1[Self.rank - 1].value()
+                                self.shape_1[Self.rank - 1]
                             ):
                                 self.func_1[1](Coord(start_indices_1))
                                 var si = start_indices_1
@@ -786,8 +785,8 @@ def _dual_elementwise_impl_gpu_grid_stride[
     )
 
     var any_unaligned = (
-        Int(shape_0[rank - 1].value()) % simd_width != 0
-        or Int(shape_1[rank - 1].value()) % simd_width != 0
+        Int(shape_0[rank - 1]) % simd_width != 0
+        or Int(shape_1[rank - 1]) % simd_width != 0
     )
 
     @inline(.always)
@@ -882,14 +881,12 @@ def _elementwise_impl_gpu[
     ]()
     comptime elems_per_thread = get_defined_int[
         "MOJO_ELEMENTWISE_ELEMS_PER_THREAD",
-        4 if has_nvidia_gpu_accelerator() else 1,
+        4 if ctx.target.is_nvidia_gpu() else 1,
     ]()
     comptime clc_min_packed_per_row = get_defined_int[
         "MOJO_ELEMENTWISE_CLC_MIN_PACKED_PER_ROW", 9
     ]()
-    var packed_elems_per_row = ufloordiv(
-        Int(shape[rank - 1].value()), simd_width
-    )
+    var packed_elems_per_row = ufloordiv(Int(shape[rank - 1]), simd_width)
     var shape_idx = coord_to_index_list(shape)
 
     var length = Int(shape.product())
@@ -902,7 +899,7 @@ def _elementwise_impl_gpu[
     # accelerator-arch predicate is only evaluated when work-stealing is
     # actually enabled. This avoids per-instantiation comptime cost in the
     # common case where `_USE_CLC_WORK_STEALING` is off.
-    comptime if _USE_CLC_WORK_STEALING and _has_sm_100x_or_newer():
+    comptime if _USE_CLC_WORK_STEALING and ctx.target._is_sm_100x_or_newer():
         var num_packed = ufloordiv(length, simd_width)
         var num_tiles = uceildiv(num_packed, block_size * elems_per_thread)
 
@@ -1036,7 +1033,7 @@ def _dual_elementwise_impl_gpu[
     ]()
     comptime elems_per_thread = get_defined_int[
         "MOJO_ELEMENTWISE_ELEMS_PER_THREAD",
-        4 if has_nvidia_gpu_accelerator() else 1,
+        4 if ctx.target.is_nvidia_gpu() else 1,
     ]()
 
     var max_length = Int(shape_0.product())

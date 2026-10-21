@@ -60,10 +60,10 @@ __extension Attention:
     @inline(.always)
     def mla_decode(
         mut self,
-        exp_sum_ptr: UnsafePointer[
+        exp_sum_ptr: MutPointer[
             Scalar[get_accum_type[Self.q_type]()], MutAnyOrigin
         ],
-        qk_max_ptr: UnsafePointer[
+        qk_max_ptr: MutPointer[
             Scalar[get_accum_type[Self.q_type]()], MutAnyOrigin
         ],
         num_partitions: Int,
@@ -200,7 +200,9 @@ __extension Attention:
             self.batch_idx,
             self.kv_head_idx(),
             VBufT.SmemParentType(
-                (self.v_smem_ptr + v_warp_smem_offset).as_unsafe_any_origin(),
+                self.v_smem_ptr.unsafe_offset(
+                    v_warp_smem_offset
+                ).as_unsafe_any_origin(),
                 VBufT._SmemParentLayout(),
             ),
             end,
@@ -241,8 +243,7 @@ __extension Attention:
         ]
 
         @inline(.always)
-        @__parameter
-        def mma_qk():
+        def mma_qk() {imm}:
             self.zero_p_buffer[0]()
             # ceildiv (not floor): when depth % BK != 0 (Kimi MLA: 576 %
             # 128 == 64) we must still process the partial K-tile.  Q's
@@ -259,8 +260,7 @@ __extension Attention:
                     )
 
         @inline(.always)
-        @__parameter
-        def mma_pv():
+        def mma_pv() {imm}:
             # Each warp's v_buffer holds only depth_per_warp tiles
             # (loaded from the warp's LDS depth offset), so mma_subtile
             # directly gives the warp's depth range.
@@ -281,8 +281,7 @@ __extension Attention:
         )
 
         @inline(.always)
-        @__parameter
-        def prefetch_next():
+        def prefetch_next() {mut k_buffer}:
             """Prefetch next K after current LDS reads have drained.
 
             MLA: V is aliased onto K's SMEM, so there's no separate V DMA;
@@ -294,8 +293,7 @@ __extension Attention:
             _ = k_buffer.load_from_dram[0]()
 
         @inline(.always)
-        @__parameter
-        def process_tile[has_next: Bool]():
+        def process_tile[has_next: Bool]() {mut self, imm}:
             """Process one KV tile.
 
             K is already in LDS when called.  V is loaded from the same

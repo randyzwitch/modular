@@ -932,10 +932,10 @@ static LogicalResult concretizeLocOf(ArgOrOp &argOrOp, ImplNode *inode) {
 
 static LogicalResult
 concretizeLocsInScope(iterator_range<Block::iterator> scope, ImplNode *inode) {
-  // Location concretization cannot yield and restart. Suppress blocker
-  // registration for this node while concretizing locations. Empty
+  // Location concretization cannot yield and restart. Add a blocker to ensure
+  // no blockers are set for this node while concretizing locations. Empty
   // concretization results will result in UnknownLoc.
-  inode->suppressBlockers = true;
+  inode->blocker = std::make_pair(inode->inst.getLoc(), nullptr);
   for (Operation &op : scope) {
     op.walk([&](Operation *op) {
       if (failed(concretizeLocOf(*op, inode)))
@@ -972,7 +972,7 @@ concretizeLocsInScope(iterator_range<Block::iterator> scope, ImplNode *inode) {
       return WalkResult::advance();
     });
   }
-  inode->suppressBlockers = false;
+  inode->blocker.reset();
   return success(!inode->error);
 }
 
@@ -1539,15 +1539,12 @@ void Elaborator::completeImplNodeProcessing(ImplNode *inode) {
 }
 
 void Elaborator::processImplNodeTask(ImplNode *inode) {
-  // Hold a resume guard for the duration of the pass so blocker completions
-  // cannot re-run the node while it is still being processed.
-  inode->pendingResumes.fetch_add(1);
   // Process the node. If processing the node got pre-empted, then return. It
   // will get scheduled again later.
   // If processImplNode returns success, it means the node is either fully
   // processed or in error state, no more to do here so we can complete it.
   // Otherwise, it means the node is being suspended and will be resumed later
-  // once its blockers are done.
+  // once its blocker is done.
   if (succeeded(processImplNode(inode))) {
     // Only increment numWorkItems if inode is not in error state because we
     // don't put an errored-out node's dependencies back onto the worklist. This
@@ -1559,15 +1556,6 @@ void Elaborator::processImplNodeTask(ImplNode *inode) {
       g.numWorkItems.fetch_add(1);
     completeImplNodeProcessing(inode);
   }
-  // Release the guard. If every registered blocker completed while this pass
-  // ran, re-run the node here — no resume is left to do it. The nested
-  // invocation signals the worklist once, so back it with a work item.
-  if (inode->pendingResumes.fetch_sub(1) == 1 && !inode->done &&
-      !inode->blockers.empty() && !inode->parent->getIsError()) {
-    inode->blockers.clear();
-    g.numWorkItems.fetch_add(1);
-    processImplNodeTask(inode);
-  }
   // Signal the worklist that the work is complete.
   if (!inode->parent->getIsError())
     signalWorklist();
@@ -1576,25 +1564,6 @@ void Elaborator::processImplNodeTask(ImplNode *inode) {
 void Elaborator::scheduleImplNode(ImplNode *inode) {
   cpuDevice.getWorkQueue()->addTask(
       [inode, this] { processImplNodeTask(inode); });
-}
-
-void Elaborator::registerBlocker(ImplNode *inode, Location from,
-                                 ParamNode *genNode) {
-  inode->blockers.emplace_back(from, genNode);
-  inode->pendingResumes.fetch_add(1);
-  genNode->andThenAsync([inode, this] {
-    // Re-process only once every registered blocker has completed and no
-    // processing pass is in flight (a pass holds a guard count).
-    if (inode->pendingResumes.fetch_sub(1) == 1) {
-      inode->blockers.clear();
-      processImplNodeTask(inode);
-      return;
-    }
-    // Another blocker completion or the in-flight pass resumes the node;
-    // consume the work item added for this waiter on callee completion.
-    if (!inode->parent->getIsError())
-      signalWorklist();
-  });
 }
 
 LogicalResult Elaborator::processImplNode(ImplNode *inode) {
@@ -1704,22 +1673,38 @@ ElaborationState Elaborator::processOp(ImplNode *node, Operation *op) {
 
 ParamNode *Elaborator::getOrCreateNode(ParameterExprArrayAttr values,
                                        GeneratorOpInterface gen, size_t depth) {
-  // TODO: Split this into `get` and `create` methods, so that some can be
-  // read-only accesses.
-  ParamNode *paramNode = g.nodes.modify([&](auto &map) {
-    std::unique_ptr<ParamNode> &n = map[{values, gen}];
-    if (!n)
-      n = std::make_unique<ParamNode>(cpuDevice, gen, values, depth, &g);
-    return n.get();
+  // Most calls name a node that already exists, so look it up under the reader
+  // lock and take the writer lock only to create one. `SmartRWMutex` cannot be
+  // upgraded, so the writer lock repeats the lookup: another thread can insert
+  // this key while no lock is held, and `specializeGenerator` elects the thread
+  // that elaborates a node by test-and-set on the node itself, which requires
+  // exactly one node per key.
+  std::pair<ParameterExprArrayAttr, GeneratorOpInterface> key(values, gen);
+  ParamNode *paramNode = g.nodes.read([&key](const auto &map) -> ParamNode * {
+    if (auto it = map.find(key); it != map.end())
+      return it->second.get();
+    return nullptr;
   });
+  if (!paramNode) {
+    paramNode = g.nodes.modify([&](auto &map) {
+      std::unique_ptr<ParamNode> &n = map[key];
+      if (!n)
+        n = std::make_unique<ParamNode>(cpuDevice, gen, values, depth, &g);
+      return n.get();
+    });
+  }
   // Add the node to the concrete nodes map regardless of whether it was
   // created or not. This guarantees that both nodes (ParamNode and ImplNode)
   // are in the corresponding maps (g.nodes and concreteNodes) when this
   // function returns.
   StringAttr name = paramNode->getMangledName();
   ImplNode *implNode = &paramNode->impl;
-  concreteNodes.modify(
-      [name, implNode](auto &map) { map.try_emplace(name, implNode); });
+  bool isConcrete = concreteNodes.read(
+      [name](const auto &map) { return map.contains(name); });
+  if (!isConcrete) {
+    concreteNodes.modify(
+        [name, implNode](auto &map) { map.try_emplace(name, implNode); });
+  }
   return paramNode;
 }
 
@@ -1776,9 +1761,13 @@ ElaborationState Elaborator::specializeGenerator(ImplNode *inode,
     // In multi-threaded execution, call resolution is also deferred as late as
     // possible. This maximizes parallelism on the expansion graph (without
     // intra-node parallelism) while correctly handling recursion.
-    if (addWaiter && !inode->suppressBlockers) {
+    if (addWaiter && !inode->blocker.has_value()) {
       if (genNode->state.addWaiter()) {
-        registerBlocker(inode, from, genNode);
+        inode->blocker = std::make_pair(from, genNode);
+        genNode->andThenAsync([inode, this] {
+          inode->blocker.reset();
+          processImplNodeTask(inode);
+        });
         return ElaborationState::skipNode();
       }
       // Raced with node completion.
@@ -1852,22 +1841,31 @@ ElaborationState Elaborator::specializeGenerator(ImplNode *inode,
     // ParametricNode (or similar) that doesn't store the input parameters, in
     // which we could store the ParameterUseDefGraph.
 
-    ParameterUseDefGraph *genNodeGraph = knownGraphs.modify(
-        [gen, &paramCache = this->paramCache](auto &map) mutable {
+    // Most generators already have a graph, so look it up under the reader lock
+    // and take the writer lock only to compute a missing one.
+    ParameterUseDefGraph *genNodeGraph =
+        knownGraphs.read([gen](const auto &map) -> ParameterUseDefGraph * {
           if (auto it = map.find(gen); it != map.end())
             return it->second.get();
-          // Compute a new graph. The computed graph could end up getting
-          // discarded if two threads end up here at the same time for the same
-          // generator.
-          auto newGraph =
-              std::make_unique<ParameterUseDefGraph>(gen.getBodyRegion());
-
-          // calculate() modifies gen.getBodyRegion(), so this needs to be done
-          // in a thread safe manner to avoid tsan failures.
-          newGraph->calculate(paramCache.getThreadLocalCache());
-
-          return map.try_emplace(gen, std::move(newGraph)).first->second.get();
+          return nullptr;
         });
+    if (!genNodeGraph) {
+      genNodeGraph = knownGraphs.modify([&gen, this](auto &map) mutable {
+        // Repeat the lookup: another thread can insert this generator while no
+        // lock is held.
+        if (auto it = map.find(gen); it != map.end())
+          return it->second.get();
+
+        auto newGraph =
+            std::make_unique<ParameterUseDefGraph>(gen.getBodyRegion());
+
+        // calculate() modifies gen.getBodyRegion(), so this needs to be done
+        // in a thread safe manner to avoid tsan failures.
+        newGraph->calculate(paramCache.getThreadLocalCache());
+
+        return map.try_emplace(gen, std::move(newGraph)).first->second.get();
+      });
+    }
 
     // Clone the body of the generator into the function.
     // TODO: is there a nice way for us to avoid cloning this?
@@ -1941,10 +1939,14 @@ ElaborationState Elaborator::specializeGenerator(ImplNode *inode,
                           std::move(evaluator)};
   newFuncNode->stack.push_back(std::move(item));
 
-  if (addWaiter && !inode->suppressBlockers) {
+  if (addWaiter && !inode->blocker.has_value()) {
     [[maybe_unused]] bool added = genNode->state.addWaiter();
     assert(added);
-    registerBlocker(inode, from, genNode);
+    inode->blocker = std::make_pair(from, genNode);
+    genNode->andThenAsync([inode, this] {
+      inode->blocker.reset();
+      processImplNodeTask(inode);
+    });
   }
   g.numWorkItems.fetch_add(1);
   scheduleImplNode(newFuncNode);
@@ -2076,6 +2078,14 @@ ErrorTreeOrSuccess Elaborator::bundleCompileOffloadOp(CompileOffloadOp op,
           return std::make_pair(newGenRef, WalkResult::skip());
         });
     symbol = cast<SymbolConstantAttr>(replacer.replace(symbol));
+
+    // The replacer above reaches the offload function's parameters only, so a
+    // struct referenced solely by `opaque_plugin` would never be exported.
+    // `compileOffloads` stamps the rewritten target on the slice.
+    if (target.getOpaquePlugin()) {
+      offloadInfo.slicedTarget =
+          dyn_cast_or_null<TargetInfoAttr>(replacer.replace(Attribute(target)));
+    }
 
     auto iter =
         offloadInfo.symbols.insert({func, OffloadInfo::Group::SymbolInfo{}})
@@ -2391,7 +2401,7 @@ struct GraphEdge {
   /// In the graph edge, this ParamNode represents the caller node.
   ParamNode *pnode;
   /// This is the index into the concatenated range over
-  /// `[*dependencies, *blockers]` pointing to the callee ParamNode.
+  /// `[*dependencies, blocker]` pointing to the callee ParamNode.
   size_t depIdx;
 
   /// This function returns the callee ParamNode by indexing into the
@@ -2400,7 +2410,7 @@ struct GraphEdge {
     auto &inode = pnode->impl;
     if (depIdx < inode.dependencies.size())
       return inode.dependencies[depIdx].second;
-    return inode.blockers[depIdx - inode.dependencies.size()].second;
+    return inode.blocker->second;
   }
   /// Return the location on the callee side representing where the edge
   /// originates from, to be used for diagnostic reporting.
@@ -2408,7 +2418,7 @@ struct GraphEdge {
     auto &inode = pnode->impl;
     if (depIdx < inode.dependencies.size())
       return inode.dependencies[depIdx].first;
-    return inode.blockers[depIdx - inode.dependencies.size()].first;
+    return inode.blocker->first;
   }
   /// Return true if this edge is a blocker/interpreter edge.
   bool isBlockerEdge() const {
@@ -2439,7 +2449,7 @@ struct GraphEdge {
   GraphEdge end() const {
     ParamNode *next = getPointee();
     ImplNode &inode = next->impl;
-    return {next, inode.dependencies.size() + inode.blockers.size()};
+    return {next, inode.dependencies.size() + inode.blocker.has_value()};
   }
 
   /// GraphEdge is its own iterator.
@@ -2547,18 +2557,30 @@ bool Elaborator::diagnoseAndBreakRecursion(unsigned generation,
 
   // These are the nodes we are going to reschedule at the end.
   std::vector<ImplNode *> reschedule;
-  // Suspended SCC members are woken by their blocker resumes rather than a
-  // reschedule, so progress is not implied by `reschedule` alone.
-  bool brokeScc = false;
+
+  // A set of ParamNode that is waiting on a blocker.
+  DenseSet<ParamNode *> waitingOnBlocker;
+  auto isBlocking = [&](GraphEdge edge) {
+    // If the edge src has a blocker or its dst has a blocker, then the edge is
+    // blocked.
+    return edge.pnode->impl.blocker.has_value() ||
+           waitingOnBlocker.contains(edge.getPointee());
+  };
 
   // Early increment since we will modify the graph as we go.
   for (auto sccIt = llvm::scc_begin(graph); !sccIt.isAtEnd();) {
-    if (!sccIt.hasCycle()) {
-      ++sccIt;
-      continue;
-    }
+    bool hasCycle = sccIt.hasCycle();
     std::vector<GraphEdge> scc = *sccIt;
     ++sccIt;
+
+    // Classify before breaking, also run this before hasCycle check.
+    bool blocking = llvm::any_of(scc, isBlocking);
+    if (blocking)
+      for (GraphEdge edge : scc)
+        waitingOnBlocker.insert(edge.pnode);
+
+    if (!hasCycle)
+      continue;
 
     // First build a set of edges in the SCC for convenient lookup.
     inSCC.clear();
@@ -2581,8 +2603,13 @@ bool Elaborator::diagnoseAndBreakRecursion(unsigned generation,
       break;
     }
 
+    // If this SCC is waiting on a blocker, don't schedule it.
+    if (blocking) {
+      sccNodes.clear();
+      continue;
+    }
+
     // Now, we break all the edges in the SCC for each node in the SCC.
-    brokeScc = true;
     for (ParamNode *node : sccNodes) {
       ImplNode *inode = &node->impl;
       std::vector<std::pair<Location, ParamNode *>> newDeps;
@@ -2593,17 +2620,13 @@ bool Elaborator::diagnoseAndBreakRecursion(unsigned generation,
           inode->sccRemovedDeps.push_back(dep);
       }
 
-      // A node suspended on blockers still holds its unconsumed processing
-      // count and is re-run by its blocker resume, so it gets neither a
-      // reschedule nor the extra count reserved for the rescheduled pass.
-      bool suspended = inode->pendingResumes.load() > 0;
+      // Decrement the number of dependencies and set the new dependencies.
       inode->numDependencies -=
-          (inode->dependencies.size() - newDeps.size() - (suspended ? 0 : 1));
+          (inode->dependencies.size() - newDeps.size() - 1);
       inode->dependencies = std::move(newDeps);
       inode->sccCh = AsyncValueRef<Chain>::allocate(cpuDevice);
       sccChains.push_back(inode->sccCh.copy());
-      if (!suspended)
-        reschedule.push_back(inode);
+      reschedule.push_back(inode);
     }
 
     // When all of them are done as individual nodes, they will reset their
@@ -2623,7 +2646,7 @@ bool Elaborator::diagnoseAndBreakRecursion(unsigned generation,
     g.numWorkItems.fetch_add(1);
     scheduleImplNode(inode);
   }
-  return brokeScc || !reschedule.empty();
+  return !reschedule.empty();
 }
 
 //===----------------------------------------------------------------------===//

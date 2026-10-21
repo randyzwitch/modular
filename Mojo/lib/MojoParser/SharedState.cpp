@@ -25,6 +25,7 @@
 #include "ParserEvaluationContext.h"
 #include "Signatures.h"
 
+#include "Mojo/DepGraphDialect/DepGraphAnalysis.h"
 #include "Mojo/KGENDialect/KGENUtils.h"
 #include "Mojo/MojoParser/ASTDecl.h"
 #include "Mojo/MojoParser/ASTType.h"
@@ -55,6 +56,7 @@
 #include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/IR/Location.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/ADT/bit.h"
@@ -171,6 +173,15 @@ private:
       return &shared.getTopLevelDecl();
 
     StringAttr rootAttr = symbol.getRootReference();
+    for (auto st : shared.getTopLevelDecl().lookupInCurrentScope(rootAttr)) {
+      // This must be a recognizable struct emitted for closures.
+      assert(rootAttr.getValue().starts_with(kClosurePrefix) ||
+             rootAttr.getValue().starts_with(kClosureExtensionPrefix) ||
+             rootAttr.getValue().starts_with(kClosureInflatedPrefix));
+      assert(isa<StructASTDecl>(st));
+      return st;
+    }
+
     auto nestedRefs = symbol.getNestedReferences().drop_back();
     auto it = resolvedSymbolParents.find({rootAttr, nestedRefs});
     if (it != resolvedSymbolParents.end())
@@ -218,8 +229,7 @@ private:
 
           // Don't fully resolve containers, they'll get resolved if something
           // is needed from within them.
-          if (isa_and_nonnull<FileModuleOp, PackageOp, StructDeclOp,
-                              TraitDeclOp>(decl->getIfOperation()))
+          if (isa<FileModuleASTDecl, PackageASTDecl, TypeASTDecl>(decl))
             return mlir::success();
 
           // Fully resolve every other decl.
@@ -296,7 +306,7 @@ struct SharedState::Impl {
   DenseMap<std::pair<SymbolTable *, StringAttr>, unsigned> symbolTableCounters;
 
   /// The top-level decl containing everything being parsed.
-  ASTDecl *topLevelDecl = nullptr;
+  TopLevelModuleASTDecl *topLevelDecl = nullptr;
 
   /// This is the AST type that corresponds to TypeCheckErrorType.
   ASTType typeCheckErrorType;
@@ -332,24 +342,14 @@ struct SharedState::Impl {
   /// The parser configuration used when loading bytecode.
   mlir::ParserConfig bytecodeParserContext;
 
-  /// Closure traits have a unique generator type and are global to the module.
-  /// Cache previously built traits.
-  DenseMap<GeneratorType, ASTDecl *> closureTraits;
-
   /// The decl corresponding to the universal parametric closure trait.
   ASTDecl *parametricClosureTrait = nullptr;
-
-  /// Stateless closure extension structs, keyed by the (source trait,
-  /// target trait) operation pair and the owning file module.
-  DenseMap<std::pair<std::pair<Operation *, Operation *>, ASTDecl *>, ASTDecl *>
-      closureExtensions;
 
   /// The capture values and decls associated with their enclosing nested
   /// function. This data structure is populated during the parsing of the FnOp
   /// the key ASTDecl wraps.
   DenseMap<ASTDecl *, llvm::MapVector<StringRef, Capture>> capturesInScope;
   DenseMap<ASTDecl *, CaptureConvention> captureConventionForScope;
-  DenseMap<Operation *, ClosureParamCaptures> closureParamCaptures;
 
   /// Function type conversion thunks in each module.
   // The key is an ArrayAttr containing two elements:
@@ -362,11 +362,17 @@ struct SharedState::Impl {
   //   "clarifying parameters", see TAPCPTTT).
   DenseMap<Attribute, FnOp> conversionThunks;
 
-  /// Parametric-closure extension structs, keyed on the (source, target)
-  /// closure instances the extension bridges between.
-  DenseMap<std::pair<TraitSymbolAttr, TraitSymbolAttr>, StructDeclOp>
-      paramClosureExtensions;
-  DenseMap<FnTypeGeneratorType, StructDeclOp> inflatedClosureStructs;
+  /// Parametric-closure extension structs, keyed on their `closureThunkKey`:
+  /// the pair of signatures the extension bridges between.
+  DenseMap<Attribute, StructDeclOp> paramClosureExtensions;
+
+  /// Inflated closure wrapper structs, keyed on their `closureThunkKey`: the
+  /// signature the wrapper inflates.
+  DenseMap<Attribute, StructDeclOp> inflatedClosureStructs;
+
+  /// Closure `__device_type` companion structs, keyed on their
+  /// `closureThunkKey`: the name of the storage struct they mirror.
+  DenseMap<Attribute, StructDeclOp> closureDeviceTypeStructs;
 
   /// This caches non-trivial implicit convertibility checks from one type to
   /// another.
@@ -443,6 +449,7 @@ SharedState::SharedState(llvm::SourceMgr &sourceMgr, ParserConfig &config)
   docsBasePath = config.docsBasePath;
 
   preloadAllKGENDialects(config.context);
+  compilerCaches = KGEN::CompilerCaches::getOrCreate(config.context);
 
   // Record any existing buffers in the source manager.
   for (int i = 0, e = sourceMgr.getNumBuffers(); i < e; ++i) {
@@ -474,7 +481,7 @@ bool SharedState::shouldDiagnoseMissingDocStrings() const {
   return impl->diagnoseMissingDocStrings;
 }
 
-void SharedState::initialize(ASTDecl &topLevelDecl) {
+void SharedState::initialize(TopLevelModuleASTDecl &topLevelDecl) {
   assert(!impl->topLevelDecl && "already initialized");
   impl->topLevelDecl = &topLevelDecl;
   getModuleLoader().initializeTopLevel(topLevelDecl);
@@ -484,8 +491,8 @@ void SharedState::initialize(ASTDecl &topLevelDecl) {
   // https://docs.python.org/3/library/functions.html#built-in-funcs
   // https://docs.python.org/3/reference/executionmodel.html#naming-and-binding
   ASTDecl &builtinsDecl = declResolver->addDecl(
-      topLevelDecl.getIfOperation(), topLevelDecl.getLoc(), StringAttr(),
-      nullptr, topLevelDecl.getCursor(), topLevelDecl.getCursor(), -1);
+      topLevelDecl.getOp(), topLevelDecl.getLoc(), StringAttr(), nullptr,
+      topLevelDecl.getCursor(), topLevelDecl.getCursor(), -1);
   addBuiltinTypes(builtinsDecl);
   builtinsDecl.resolvedness = DeclResolvedness::body;
 
@@ -512,31 +519,9 @@ void SharedState::collectParamRefsInType(
                                       requiredSignatureDepth);
 }
 
-void SharedState::deleteDecl(ASTDecl &decl) {
-  if (!decl.getUserNameIfOperation())
-    return;
-  Operation *op = decl.getIfOperation();
-
-  // Remove from global maps.
-  // Func needs a special case since it may or may not be a symbol.
-  if (auto func = dyn_cast<FnOp>(op)) {
-    if (SymbolRefAttr sym = decl.getSymbolRef())
-      declResolver->declForFuncSymbol.erase(sym);
-    impl->sourceNames.forgetSourceName(func);
-  } else if (auto symbolDecl = dyn_cast<mlir::SymbolOpInterface>(op)) {
-    if (SymbolRefAttr sym = decl.getSymbolRef())
-      declResolver->declForTypeSymbol.erase(sym);
-    impl->sourceNames.forgetSourceName(symbolDecl);
-    impl->symbolTables.getSymbolTable(op->getParentOp()).remove(op);
-  }
-  op->erase();
-
-  // Set the IRValue to nullptr, so that any reference pointing to the decl can
-  // check if it's valid.
-  decl.setIRValue(nullptr);
+TopLevelModuleASTDecl &SharedState::getTopLevelDecl() {
+  return *impl->topLevelDecl;
 }
-
-ASTDecl &SharedState::getTopLevelDecl() { return *impl->topLevelDecl; }
 
 MojoInflightDiag SharedState::emitError(Location loc, const Twine &message) {
   return diags.emitError(loc, message);
@@ -592,8 +577,8 @@ void SharedState::addBuiltinTypes(ASTDecl &builtinsDecl) {
   auto anyNonStructTypeType = NonStructTypeType::get(getContext());
   auto addMagicMLIRDecl = [&](StringRef name, Type magicType) {
     TypedAttr value = TypeParamAttr::get(magicType, anyNonStructTypeType);
-    resolver.addFullyResolvedDecl(PValue(value), name, builtinsDecl.getLoc(),
-                                  &builtinsDecl);
+    resolver.addFullyResolvedDecl(PValue(value), StringAttr::get(context, name),
+                                  builtinsDecl.getLoc(), &builtinsDecl);
   };
 
   addMagicMLIRDecl("__mlir_attr", MagicMLIRAttrType::get(context));
@@ -721,9 +706,8 @@ auto SharedState::lookupAndResolveDecl(StringRef name, SMLoc loc,
     // A package's own scope is empty: its public surface is its __init__'s
     // scope. Redirect any lookup *rooted at* a package to __init__, so
     // component access and re-export resolution see the package's symbols.
-    if (isa_and_nonnull<PackageOp>(scope.getIfOperation())) {
-      FailureOr<ASTDecl *> initOrFailure =
-          declResolver->bodyResolvePackageInit(scope, loc);
+    if (auto *package = dyn_cast<PackageASTDecl>(&scope)) {
+      FailureOr<ASTDecl *> initOrFailure = package->resolveInitModule(loc);
       if (failed(initOrFailure))
         return LookupResult::getErroneous();
       if (ASTDecl *initDecl = *initOrFailure)
@@ -742,9 +726,7 @@ auto SharedState::lookupAndResolveDecl(StringRef name, SMLoc loc,
     do {
       ArrayRef<ASTDecl *> e = lookupInScope(*curSearchScope);
       if (!e.empty()) {
-        if (curSearchScope &&
-            isa_and_nonnull<StructDeclOp, TraitDeclOp>(
-                curSearchScope->getIfOperation()) &&
+        if (isa_and_nonnull<TypeASTDecl>(curSearchScope) &&
             !(*e.front()).getIfIRValue().getIfPValue()) {
           // Skip struct/trait bodies when searching up parent scopes, unless
           // the value is a parameter.
@@ -755,7 +737,7 @@ auto SharedState::lookupAndResolveDecl(StringRef name, SMLoc loc,
         }
         return LookupResult::getSuccess(e);
       }
-    } while ((curSearchScope = curSearchScope->parentDecl));
+    } while ((curSearchScope = curSearchScope->getParentDecl()));
     // If we found a name in a context that we skip, return it in the failure
     // for diagnostic reporting.
     return LookupResult::getFailure(skipped);
@@ -771,16 +753,18 @@ auto SharedState::lookupAndResolveDecl(StringRef name, SMLoc loc,
   // If the lookup succeeded, make sure the signature for the referenced decls
   // are understood. Make a copy of the entries to avoid dangling references if
   // we end up invalidating the decl map.
+  auto isUnresolvedImport = [](ASTDecl *decl) {
+    auto *importDecl = dyn_cast_if_present<ImportASTDecl>(decl);
+    return importDecl && importDecl->isUnresolved();
+  };
   bool wasUnresolvedImport = !resultDecls.empty() && resultDecls.front() &&
-                             isa_and_nonnull<UnresolvedImportOp>(
-                                 resultDecls.front()->getIfOperation());
+                             isUnresolvedImport(resultDecls.front());
   for (ASTDecl *decl : resultDecls) {
     // Always resolve UnresolvedImportOps since that's the point of this whole
     // function. But only resolve the ultimate declaration it's pointing to if
     // resolveTarget is true.
     // TODO(MOCO-522): Arcana docs on imports!
-    bool shouldResolve = resolveTarget || isa_and_nonnull<UnresolvedImportOp>(
-                                              decl->getIfOperation());
+    bool shouldResolve = resolveTarget || isUnresolvedImport(decl);
     if (shouldResolve) {
       if (failed(
               declResolver->resolve(*decl, DeclResolvedness::signature, loc))) {
@@ -841,8 +825,7 @@ auto SharedState::lookupAllDeclsWithName(StringRef name, SMLoc loc,
       expandWildcardImports(*curSearchScope);
       ArrayRef<ASTDecl *> e = curSearchScope->lookupInCurrentScope(nameAttr);
       if (!e.empty()) {
-        if (curSearchScope &&
-            isa_and_nonnull<StructDeclOp>(curSearchScope->getIfOperation()) &&
+        if (isa_and_nonnull<StructASTDecl>(curSearchScope) &&
             !(*e.front()).getIfIRValue().getIfPValue()) {
           // Skip struct bodies when searching up parent scopes, unless the
           // value is a parameter. But still collect them for potential use.
@@ -855,7 +838,7 @@ auto SharedState::lookupAllDeclsWithName(StringRef name, SMLoc loc,
         for (ASTDecl *decl : e)
           allDecls.push_back(decl);
       }
-    } while ((curSearchScope = curSearchScope->parentDecl));
+    } while ((curSearchScope = curSearchScope->getParentDecl()));
 
     // If we found declarations, return success.
     if (!allDecls.empty())
@@ -882,13 +865,12 @@ auto SharedState::lookupAllDeclsWithName(StringRef name, SMLoc loc,
 
   bool resolvedImport = false;
   for (ASTDecl *decl : resultDecls) {
-    if (auto importOp =
-            dyn_cast_or_null<UnresolvedImportOp>(decl->getIfOperation())) {
+    if (auto *importDecl = dyn_cast<ImportASTDecl>(decl);
+        importDecl && importDecl->isUnresolved()) {
       DeclResolvedness resolvedness = decl->resolvedness;
       if (resolvedness < DeclResolvedness::signature) {
         resolvedImport = true;
-        if (failed(declResolver->resolveSignature(importOp, *decl,
-                                                  /*resolveTarget=*/resolve))) {
+        if (failed(importDecl->resolveSignature(/*resolveTarget=*/resolve))) {
           return LookupAllResult::getErroneous();
         }
       }
@@ -911,7 +893,8 @@ PackageOp SharedState::getPrecompiledStdlibPackage() {
   ModuleState *stdState = impl->stdPackageState;
   if (!stdState || !stdState->origin || !stdState->origin->bytecodeReader)
     return {};
-  return dyn_cast_or_null<PackageOp>(stdState->decl->getIfOperation());
+  auto *packageDecl = dyn_cast<PackageASTDecl>(stdState->decl);
+  return packageDecl ? packageDecl->getOp() : PackageOp();
 }
 
 void SharedState::materializePrecompiledStdlibOp(Operation *op) {
@@ -926,12 +909,13 @@ void SharedState::materializePrecompiledStdlibOp(Operation *op) {
     (void)reader.materialize(op);
 }
 
-ASTDecl &SharedState::importModule(const ImportPath &path,
-                                   PackageOp currentPackage, llvm::SMLoc loc) {
-  return getModuleLoader().importModule(path, currentPackage, loc);
+ModuleASTDecl &SharedState::importModule(const ImportPath &path,
+                                         PackageOp currentPackage,
+                                         llvm::SMLoc loc, ASTDecl *importer) {
+  return getModuleLoader().importModule(path, currentPackage, loc, importer);
 }
 
-SmallVector<ASTDecl *>
+SmallVector<ModuleASTDecl *>
 SharedState::getNestedModuleDecls(PackageOp packageOp) const {
   return getModuleLoader().getNestedModuleDecls(packageOp);
 }
@@ -954,8 +938,9 @@ const llvm::MemoryBuffer *SharedState::openModuleFile(StringRef path,
   return getSourceMgr().getMemoryBuffer(fileID);
 }
 
-ASTDecl *SharedState::tryImportSubModule(ASTDecl &parent, StringRef name,
-                                         llvm::SMLoc loc) {
+ModuleASTDecl *SharedState::tryImportSubModule(ModuleASTDecl &parent,
+                                               StringRef name,
+                                               llvm::SMLoc loc) {
   return getModuleLoader().tryImportSubModule(parent, name, loc);
 }
 
@@ -970,6 +955,10 @@ SharedState::getWrappedSourcePath(unsigned bufferId) const {
   return it == impl->wrapperBuffers.end()
              ? std::optional<StringRef>(std::nullopt)
              : it->second;
+}
+
+void SharedState::recordDepEdge(ASTDecl *importer, ASTDecl *imported) {
+  return getModuleLoader().recordDepEdge(importer, imported);
 }
 
 bool SharedState::hasBuiltinModule() const { return useBuiltinModule; }
@@ -991,7 +980,7 @@ static SmallString<64> makeBuiltinCacheKey(const SharedState::ImportPath &path,
 
 /// Lookup a builtin trait like `AnyType`, `Deinitable`, `Copyable`,
 /// `Movable` etc.  On error this returns null but does not print an error.
-ASTDecl *SharedState::lookupBuiltinTrait(StringRef traitName, SMLoc loc) {
+TraitASTDecl *SharedState::lookupBuiltinTrait(StringRef traitName, SMLoc loc) {
   if (LLVM_UNLIKELY(!hasBuiltinModule())) {
     // I don't even know why we are allowing this
     return {};
@@ -1001,16 +990,16 @@ ASTDecl *SharedState::lookupBuiltinTrait(StringRef traitName, SMLoc loc) {
   const SmallString<64> cacheKey = makeBuiltinCacheKey(path, traitName);
   if (auto it = impl->builtinTraitCache.find(cacheKey);
       it != impl->builtinTraitCache.end())
-    return it->second;
+    return cast<TraitASTDecl>(it->second);
 
   LookupResult lookup = lookupAndResolveDecl(
       traitName, loc, importModule(path, /*currentPackage=*/nullptr, loc), true,
       false);
   if (!lookup.isFailure() && !lookup.getIfSuccess().empty()) {
     for (ASTDecl *result : lookup.getIfSuccess()) {
-      if (isa_and_nonnull<TraitDeclOp>(result->getIfOperation())) {
+      if (auto *traitDecl = dyn_cast<TraitASTDecl>(result)) {
         impl->builtinTraitCache.try_emplace(cacheKey, result);
-        return result;
+        return traitDecl;
       }
     }
   }
@@ -1018,12 +1007,12 @@ ASTDecl *SharedState::lookupBuiltinTrait(StringRef traitName, SMLoc loc) {
 }
 
 TraitType SharedState::lookupBuiltinTraitType(StringRef traitName, SMLoc loc) {
-  ASTDecl *traitDecl = lookupBuiltinTrait(traitName, loc);
-  if (!traitDecl || !isa_and_nonnull<TraitDeclOp>(traitDecl->getIfOperation()))
+  TraitASTDecl *traitDecl = lookupBuiltinTrait(traitName, loc);
+  if (!traitDecl)
     return {};
   if (failed(declResolver->resolveSignature(*traitDecl, loc)))
     return {};
-  return cast<TraitDeclOp>(traitDecl->getIfOperation()).getCanonicalTrait();
+  return traitDecl->getOp().getCanonicalTrait();
 }
 
 ASTDecl *SharedState::lookupNamedTypeDecl(StringRef name, ASTDecl &context,
@@ -1039,12 +1028,11 @@ ASTDecl *SharedState::lookupNamedTypeDecl(StringRef name, ASTDecl &context,
   // The overload set may contain multiple entries, but if it is a struct, it
   // must be a single entry and therefore we can just check that one.
   ASTDecl &firstDecl = *result.getIfSuccess()[0];
-  if (isa_and_nonnull<StructDeclOp>(firstDecl.getIfOperation()))
+  if (isa<StructASTDecl>(firstDecl))
     return &firstDecl;
 
-  if (auto aliasDecl =
-          dyn_cast_or_null<AliasDeclOp>(firstDecl.getIfOperation())) {
-    if (LIT::isMetaType(aliasDecl.getType()))
+  if (auto *aliasDecl = dyn_cast<AliasASTDecl>(&firstDecl)) {
+    if (LIT::isMetaType(aliasDecl->getOp().getType()))
       return &firstDecl;
   }
 
@@ -1055,12 +1043,12 @@ ASTDecl *SharedState::lookupNamedTypeDecl(StringRef name, ASTDecl &context,
 
 static ASTType typeForResolvedTypeDecl(SharedState &state, ASTDecl *decl,
                                        SMLoc loc) {
-  if (auto structDecl = dyn_cast_or_null<StructDeclOp>(decl->getIfOperation()))
-    return structDecl.bindReference();
-  if (auto aliasDecl = dyn_cast_or_null<AliasDeclOp>(decl->getIfOperation())) {
+  if (auto *structDecl = dyn_cast_if_present<StructASTDecl>(decl))
+    return structDecl->getOp().bindReference();
+  if (auto *aliasDecl = dyn_cast<AliasASTDecl>(decl)) {
     if (failed(state.declResolver->resolveBody(*decl, loc)))
       return state.getTypeCheckErrorType();
-    return aliasDecl.getValueAttr();
+    return aliasDecl->getOp().getValueAttr();
   }
   return state.getTypeCheckErrorType();
 }
@@ -1105,7 +1093,7 @@ ASTDecl *SharedState::getBuiltinCoroutineType(llvm::SMLoc loc) {
                                   loc);
 }
 
-ASTDecl *SharedState::getBuiltinDevicePassableTrait(llvm::SMLoc loc) {
+TraitASTDecl *SharedState::getBuiltinDevicePassableTrait(llvm::SMLoc loc) {
   ASTDecl &devicePassableModule =
       importModule({"std", "builtin", "device_passable"},
                    /*currentPackage=*/nullptr, loc);
@@ -1117,8 +1105,7 @@ ASTDecl *SharedState::getBuiltinDevicePassableTrait(llvm::SMLoc loc) {
     emitError(loc, "could not find a 'DevicePassable' type");
     return {};
   }
-  ASTDecl &firstDecl = *result.getIfSuccess()[0];
-  return &firstDecl;
+  return cast<TraitASTDecl>(result.getIfSuccess()[0]);
 }
 
 ASTDecl *SharedState::getBuiltinRaisingCoroutineType(llvm::SMLoc loc) {
@@ -1157,7 +1144,8 @@ ArrayRef<ASTDecl *> SharedState::getBuiltinFunction(ASTDecl &module,
     return {};
   }
   ArrayRef<ASTDecl *> decls = result.getIfSuccess();
-  if (!isa_and_nonnull<FnOp>(decls.front()->getIfOperation())) {
+  auto *defDecl = dyn_cast<DefASTDecl>(decls.front());
+  if (!defDecl) {
     emitError(loc, "internal error: builtin '")
         << fnName << "' does not refer to a function";
     return {};
@@ -1165,7 +1153,7 @@ ArrayRef<ASTDecl *> SharedState::getBuiltinFunction(ASTDecl &module,
   return decls;
 }
 
-void SharedState::importBuiltinModules(ASTDecl &moduleDecl) {
+void SharedState::importBuiltinModules(ModuleASTDecl &moduleDecl) {
   // Check if this is the first attempt at resolving the builtin modules.
   if (impl->implicitBuiltinImports.empty()) {
     // Import the main standard library package.
@@ -1207,7 +1195,7 @@ void SharedState::importBuiltinModules(ASTDecl &moduleDecl) {
   // Child modules must be explicitly imported by the user or re-exported by
   // std's __init__.mojo.
   StringAttr stdAttr = StringAttr::get(getContext(), "std");
-  auto &block = moduleDecl.getIfOperation()->getRegion(0).front();
+  auto &block = moduleDecl.getOp()->getRegion(0).front();
   OpBuilder builder = OpBuilder::atBlockEnd(&block);
   declResolver->createImportOp(
       moduleDecl, builder, stdAttr,
@@ -1220,9 +1208,10 @@ void SharedState::importBuiltinModules(ASTDecl &moduleDecl) {
   }
 }
 
-ASTDecl &SharedState::createModule(StringRef moduleName,
-                                   const llvm::MemoryBuffer *moduleBuffer,
-                                   FileLineColLoc loc) {
+FileModuleASTDecl &
+SharedState::createModule(StringRef moduleName,
+                          const llvm::MemoryBuffer *moduleBuffer,
+                          FileLineColLoc loc) {
   // Create a new module state.
   ModuleSpec spec{moduleName.str(),
                   /*path=*/std::string(moduleBuffer->getBufferIdentifier()),
@@ -1231,10 +1220,10 @@ ASTDecl &SharedState::createModule(StringRef moduleName,
   ModuleState &state = loader.createModuleState(
       StringAttr::get(getContext(), moduleName), moduleBuffer,
       loader.getTopLevelState(), loc, spec, /*importLoc=*/{});
-  return *state.decl;
+  return cast<FileModuleASTDecl>(*state.decl);
 }
 
-ASTDecl &SharedState::createPackage(StringRef path, StringRef name) {
+PackageASTDecl &SharedState::createPackage(StringRef path, StringRef name) {
   // Note the importLoc here is empty as this is a top-level package and so
   // isn't imported from anywhere.
   ModuleSpec spec{name.str(), path.str(), ModuleSpec::Kind::SourcePackage};
@@ -1242,25 +1231,28 @@ ASTDecl &SharedState::createPackage(StringRef path, StringRef name) {
   ModuleState &state =
       loader.createPackageState(spec, loader.getTopLevelState(),
                                 /*importLoc=*/{});
-  return *state.decl;
+  return cast<PackageASTDecl>(*state.decl);
 }
 
-ASTDecl &SharedState::createBinaryPackage(StringRef path, StringRef name) {
+PackageASTDecl &SharedState::createBinaryPackage(StringRef path,
+                                                 StringRef name) {
   ModuleSpec spec{name.str(), path.str(), ModuleSpec::Kind::Precompiled};
   ModuleLoader &loader = getModuleLoader();
   ModuleState &state =
       loader.createBinaryPackageState(SMLoc(), spec, loader.getTopLevelState());
-  return *state.decl;
+  return cast<PackageASTDecl>(*state.decl);
 }
 
-std::optional<std::string> SharedState::getModuleSourcePath(ASTDecl &module) {
+std::optional<std::string>
+SharedState::getModuleSourcePath(ModuleASTDecl &module) {
   ModuleState *state = getModuleLoader().lookupState(&module);
   if (!state)
     return std::nullopt;
   return state->sourcePath();
 }
 
-LogicalResult SharedState::materializeDeferredModule(ASTDecl &decl, SMLoc loc) {
+LogicalResult SharedState::materializeDeferredModule(ModuleASTDecl &decl,
+                                                     SMLoc loc) {
   // Only a deferred source module (FileModuleOp with an invalid cursor and a
   // recorded source path) needs materializing; everything else is a no-op.
   ModuleState *state = getModuleLoader().lookupState(&decl);
@@ -1282,6 +1274,11 @@ LogicalResult SharedState::materializeDeferredModule(ASTDecl &decl, SMLoc loc) {
   Lexer lexer(diags, moduleBuffer);
   decl.setLoc(lexer.getToken().getLoc());
   decl.setParseCursor(lexer.getCursor(), LexerCursor::getEOF(moduleBuffer));
+
+  // The source buffer is now available, so backfill the content hash that
+  // could not be computed when the deferred module was registered.
+  if (isIncrParsingEnabled())
+    state->contentHash = DepGraph::hashModuleBuffer(moduleBuffer->getBuffer());
 
   // Auto-import the core language modules and notify the listener - the
   // module's content now exists.
@@ -1334,10 +1331,8 @@ SharedState::lookupAndResolveMangledDecl(StringAttr leafRef, SMLoc loc,
   // "extension:MyStruct, so look up using that kind of name.
   StringAttr name;
   if (auto *extOp = dyn_cast_or_null<ExtensionDeclOp>(&declOp)) {
-    StringAttr baseName = extOp->getTargetStruct().value().getLeafReference();
-    std::string extensionName =
-        extensionsScopeMarker.getValue().str() + baseName.getValue().str();
-    name = StringAttr::get(extOp->getContext(), extensionName);
+    name = getExtensionName(
+        extOp->getTargetStruct().value().getLeafReference().getValue());
   } else {
     name = declOp.getDeclName();
   }
@@ -1405,6 +1400,18 @@ ASTDecl *SharedState::resolveAndGetFuncDecl(SymbolRefAttr symbol, SMLoc loc) {
   return declResolver->getDeclForFuncSymbol(symbol);
 }
 
+ASTDecl *SharedState::resolveAndGetTypeDecl(SymbolRefAttr symbol, SMLoc loc) {
+  if (!symbol)
+    return nullptr;
+  if (ASTDecl *decl = declResolver->getDeclForTypeSymbolIfExists(symbol))
+    return decl;
+  if (failed(
+          getImpl().bytecodeRefResolutionWalker.resolveBytecodeSymbolSignature(
+              symbol, loc)))
+    return nullptr;
+  return declResolver->getDeclForTypeSymbolIfExists(symbol);
+}
+
 LogicalResult
 SharedState::resolveDeclFromBytecode(ASTDecl &decl,
                                      DeclResolvedness resolvedness) {
@@ -1418,8 +1425,10 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
 
     LogicalResult result =
         llvm::TypeSwitch<Operation *, LogicalResult>(declOp)
-            .Case([&](FnOp funcOp) {
-              declResolver->declForFuncSymbol[decl.getSymbolRef()] = &decl;
+            .Case([&](FnOp) {
+              auto &fnDecl = cast<DefASTDecl>(decl);
+              declResolver->declForFuncSymbol[decl.getSymbolRef()] = &fnDecl;
+              fnDecl.createIRSignatureDecls(*declResolver);
 
               // Resolve the references from the signature.
               refWalker.walk(declOp->getAttrDictionary());
@@ -1450,10 +1459,10 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
               refWalker.walk(StructMetaType::get(structType));
               ASTDecl &structAstDecl =
                   declResolver->getDeclForTypeSymbol(targetStruct);
-              auto structOp = dyn_cast_or_null<StructDeclOp>(
-                  structAstDecl.getIfOperation());
-              assert(structOp && "extension target is not a struct");
-              decl.setTypeDeclSelf(ASTDecl::computeSelfTypeForStruct(structOp));
+              auto *structDecl = dyn_cast<StructASTDecl>(&structAstDecl);
+              assert(structDecl && "extension target is not a struct");
+              cast<ExtensionASTDecl>(decl).setSelfType(
+                  StructASTDecl::computeSelfType(structDecl->getOp()));
               return success();
             })
             .Case([&](ImportOp) {
@@ -1463,8 +1472,9 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
             .Case([&](UnresolvedImportOp unresolvedImport) {
               // Let the normal decl resolver handling insert aliases and other
               // import behavior.
-              if (failed(
-                      declResolver->resolveSignature(unresolvedImport, decl)))
+              auto &importDecl = cast<ImportASTDecl>(decl);
+              assert(importDecl.getIfUnresolvedOp() == unresolvedImport);
+              if (failed(importDecl.resolveSignature(/*resolveTarget=*/true)))
                 return failure();
               return mlir::success();
             })
@@ -1494,7 +1504,7 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
   SMLoc packageImportLoc;
   ASTDecl *parentDecl = &decl;
   do {
-    if (!isa_and_nonnull<FileModuleOp, PackageOp>(parentDecl->getIfOperation()))
+    if (!isa<FileModuleASTDecl, PackageASTDecl>(parentDecl))
       continue;
 
     // Any module inside the artifact answers, since they all share its origin.
@@ -1505,7 +1515,7 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
       packageImportLoc = origin->bytecodeImportLoc;
       break;
     }
-  } while ((parentDecl = parentDecl->parentDecl));
+  } while ((parentDecl = parentDecl->getParentDecl()));
   assert(bytecodeReader && "bytecode decl doesn't have a bytecode reader");
 
   // Functor used to resolve references within a single operation.
@@ -1602,43 +1612,39 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
                 op.getModulePathAttr(), decl.getLoc()});
           })
           .Case([&](StructDeclOp op) {
-            ASTDecl &structDecl = addDeclForOp(op, op.getSymNameAttr());
-            structDecl.setTypeDeclSelf(ASTDecl::computeSelfTypeForStruct(op));
-            for (ParamDeclAttr param : op.getParams()) {
+            auto &structDecl =
+                cast<StructASTDecl>(addDeclForOp(op, op.getSymNameAttr()));
+            structDecl.setSelfType(StructASTDecl::computeSelfType(op));
+            SmallVector<ASTDecl *> paramDecls;
+            for (auto [paramIndex, param] : llvm::enumerate(op.getParams())) {
               // Add the parameters as accessible member decls. Make sure
               // to only demangle user-visible names. Synthetic closure structs
               // use internal parameter names that should remain hidden.
               StringRef paramName =
                   op.isSynthetic() ? param.getName()
                                    : demangleParameterName(param.getName());
-              declResolver->addFullyResolvedDecl(
-                  PValue(ParamDeclRefAttr::get(param)), paramName,
-                  structDecl.getLoc(), &structDecl);
+              auto &paramDecl = declResolver->addFullyResolvedDecl(
+                  PValue(ParamDeclRefAttr::get(param)),
+                  StringAttr::get(getContext(), paramName), structDecl.getLoc(),
+                  &structDecl);
+              paramDecl.setArgOrParamNumber(static_cast<ssize_t>(paramIndex),
+                                            /*isParameter=*/true);
+              paramDecls.push_back(&paramDecl);
             }
+            structDecl.setParamDecls(paramDecls);
           })
           .Case([&](TraitDeclOp op) {
-            ASTDecl &traitDecl = addDeclForOp(op, op.getSymNameAttr());
-            traitDecl.setTypeDeclSelf(ASTDecl::computeSelfTypeForTrait(op));
+            auto &traitDecl =
+                cast<TraitASTDecl>(addDeclForOp(op, op.getSymNameAttr()));
+            traitDecl.setSelfType(TraitASTDecl::computeSelfType(op));
             // TODO(traits): Add decls for parameters, when they exist.
           })
           .Case([&](ExtensionDeclOp op) {
             SymbolRefAttr targetStruct = op.getTargetStruct().value();
-            StringAttr baseName = targetStruct.getLeafReference();
-            // Extensions are registered under two names:
-            // - "extension:MyStruct", for looking for all extensions for a
-            //   given MyStruct
-            // - "extension:", for looking for all extensions for any struct
-            //   in a given scope (useful for importing).
-            // Register this extension under both names now. The "extension:"
-            // prefix and marker are single-sourced from extensionsScopeMarker.
-            // TODO(MOCO-522): Arcana docs on this!
-            std::string extensionName = extensionsScopeMarker.getValue().str() +
-                                        baseName.getValue().str();
-            StringAttr extensionNameAttr =
-                StringAttr::get(op.getContext(), extensionName);
-            ASTDecl &extensionDecl = addDeclForOp(op, extensionNameAttr);
-            declResolver->aliasDeclInParent(&extensionDecl,
-                                            extensionsScopeMarker);
+            ASTDecl &extensionDecl = addDeclForOp(
+                op,
+                getExtensionName(targetStruct.getLeafReference().getValue()));
+            declResolver->registerExtensionDecl(extensionDecl);
           })
           .Case([&](AliasDeclOp op) {
             addDeclForOp(op, StringAttr::get(op.getContext(),
@@ -1656,17 +1662,18 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
             // stamp on an import loc.
             diags.recordImportedFileIncludeLoc(op->getLoc(), packageImportLoc);
             ASTDecl &decl = addDeclForOp(op, name);
+            auto &moduleDecl = cast<ModuleASTDecl>(decl);
 
             // Record a nested module state for this decl. The child is a
             // module inside the artifact's one file, so it shares the
             // enclosing package's origin and holds no spec of its own: it was
             // never resolved, so there is no candidate to describe.
-            auto childState = std::make_unique<ModuleState>(&decl);
+            auto childState = std::make_unique<ModuleState>(&moduleDecl);
             childState->origin = packageState->origin;
             ModuleState &moduleState =
                 packageState->insertNestedModule(name, std::move(childState));
 
-            getModuleLoader().setState(decl, moduleState);
+            getModuleLoader().setState(moduleDecl, moduleState);
             if constexpr (std::is_same_v<decltype(op), PackageOp>)
               getModuleLoader().setPackageState(op, moduleState);
           })
@@ -1674,7 +1681,7 @@ SharedState::resolveDeclFromBytecode(ASTDecl &decl,
             // Witness tables are considered signature-resolved from the start
             // since there's nothing else to resolve for its "signature". (see
             // CALROC for more).
-            ASTDecl &decl =
+            auto &decl =
                 addDeclForOp(op, op.getTraitSymbol().getFlattenedName());
             decl.resolvedness = DeclResolvedness::signature;
           })
@@ -1710,10 +1717,12 @@ LogicalResult SharedState::finalizeImportedBytecodeModules() {
   // reference structs that finalize() will delete as stubs, causing
   // verifySymbolUses to fail. We must erase them after finalize() runs.
   SmallVector<Operation *> materializedUnparsedOps;
+  SmallVector<ASTDecl *> unparsedBytecodeDecls;
   for (ASTDecl *decl : declResolver->parsedDeclList) {
     if (!decl->loadedFromBytecode ||
         decl->resolvedness != DeclResolvedness::unparsed)
       continue;
+    unparsedBytecodeDecls.push_back(decl);
     if (Operation *op = decl->getIfOperation()) {
       bool isLazy = llvm::any_of(readers, [op](mlir::BytecodeReader *r) {
         return r->isMaterializable(op);
@@ -1721,10 +1730,8 @@ LogicalResult SharedState::finalizeImportedBytecodeModules() {
       if (!isLazy)
         materializedUnparsedOps.push_back(op);
     }
-    // Clear the ASTDecl pointer to avoid a dangling reference after the op
-    // is erased below or deleted as a stub by finalize().
-    decl->setIRValue(PValue(BoolAttr::get(getContext(), false)));
   }
+  declResolver->eraseDecls(unparsedBytecodeDecls);
 
   for (auto &origin : getModuleLoader().getOrigins()) {
     if (!origin->bytecodeReader)
@@ -1783,36 +1790,24 @@ static void adjustTokenEndPoint(SharedState &shared, SMLoc &loc) {
   loc = SMLoc::getFromPointer(loc.getPointer() + tokenSize);
 }
 
-ASTDecl *SharedState::getOrCreateClosureTrait(SMLoc loc, ASTDecl &moduleDecl,
-                                              FnTypeGeneratorType sig) {
-  auto [key, numPrependedCaptures] = closureEmitter->getClosureTraitKey(sig);
-  auto ptr = impl->closureTraits.find(key);
-  if (ptr == impl->closureTraits.end()) {
-    auto result = closureEmitter->createClosureTrait(moduleDecl, sig, key,
-                                                     numPrependedCaptures, loc);
-    impl->closureTraits.insert({key, result});
-    return result;
-  }
-  return ptr->second;
-}
-
-ASTDecl *SharedState::getUniversalParametricClosureTrait() {
+TraitASTDecl *SharedState::getUniversalParametricClosureTrait() {
   if (!impl->parametricClosureTrait) {
     auto *closureTrait = IREmitter::createParametricClosureTrait(*this);
     assert(closureTrait && "internal error: failed to create closure trait");
     impl->parametricClosureTrait = closureTrait;
   }
 
-  return impl->parametricClosureTrait;
+  return cast<TraitASTDecl>(impl->parametricClosureTrait);
 }
 
 FnTypeGeneratorType SharedState::getClosureFnSig(TraitSymbolAttr closureInst) {
-  ASTDecl *traitDecl = getUniversalParametricClosureTrait();
-  ParameterEvaluator evaluator = *populateTraitBindingEvaluator(
-      closureInst, cast<TraitDeclOp>(traitDecl->getIfOperation()));
+  TraitASTDecl *traitDecl = getUniversalParametricClosureTrait();
+  ParameterEvaluator evaluator =
+      *populateTraitBindingEvaluator(closureInst, traitDecl->getOp());
 
-  auto callAlias = cast<AliasDeclOp>(
-      traitDecl->lookupInCurrentScope("__call__").front()->getIfOperation());
+  AliasDeclOp callAlias =
+      cast<AliasASTDecl>(traitDecl->lookupInCurrentScope("__call__").front())
+          ->getOp();
   return cast<FnTypeGeneratorType>(evaluator.replace(callAlias.getType()));
 }
 
@@ -1826,18 +1821,8 @@ bool SharedState::isUniversalParametricClosureTrait(TraitSymbolAttr symbol) {
          symbol.getSymbol();
 }
 
-ASTDecl *SharedState::getOrCreateExtension(SMLoc loc, TraitDeclOp sourceTrait,
-                                           TraitDeclOp targetTrait,
-                                           ASTType sourceMetaType,
-                                           ASTDecl *moduleDecl) {
-  auto key = std::make_pair(
-      std::make_pair(sourceTrait.getOperation(), targetTrait.getOperation()),
-      moduleDecl);
-  auto &extension = impl->closureExtensions[key];
-  if (!extension)
-    extension = closureEmitter->createExtensionStruct(
-        *moduleDecl, sourceTrait, targetTrait, sourceMetaType, loc);
-  return extension;
+bool SharedState::isUniversalParametricClosureTrait(ASTDecl *trait) {
+  return trait == getUniversalParametricClosureTrait();
 }
 
 FnOp SharedState::getOrCreateFunctionThunk(Attribute key, CreateThunkFn create,
@@ -1848,22 +1833,31 @@ FnOp SharedState::getOrCreateFunctionThunk(Attribute key, CreateThunkFn create,
   return thunk;
 }
 
-StructDeclOp SharedState::getOrCreateParamClosureExtension(
-    TraitSymbolAttr srcClosureInst, TraitSymbolAttr tgtClosureInst,
-    CreateParamClosureExtensionFn create) {
-  StructDeclOp &extension =
-      impl->paramClosureExtensions[{srcClosureInst, tgtClosureInst}];
+StructDeclOp
+SharedState::getOrCreateParamClosureExtension(Attribute key,
+                                              CreateClosureStructFn create) {
+  StructDeclOp &extension = impl->paramClosureExtensions[key];
   if (!extension)
     extension = create();
   return extension;
 }
 
-StructDeclOp SharedState::getOrCreateInflatedClosureForSig(
-    FnTypeGeneratorType fnSig, CreateParamClosureExtensionFn create) {
-  StructDeclOp &inflated = impl->inflatedClosureStructs[fnSig];
+StructDeclOp
+SharedState::getOrCreateInflatedClosure(Attribute key,
+                                        CreateClosureStructFn create) {
+  StructDeclOp &inflated = impl->inflatedClosureStructs[key];
   if (!inflated)
     inflated = create();
   return inflated;
+}
+
+StructDeclOp
+SharedState::getOrCreateClosureDeviceType(Attribute key,
+                                          CreateClosureStructFn create) {
+  StructDeclOp &deviceType = impl->closureDeviceTypeStructs[key];
+  if (!deviceType)
+    deviceType = create();
+  return deviceType;
 }
 
 const llvm::MapVector<StringRef, Capture> &
@@ -1874,9 +1868,9 @@ SharedState::getCaptureRangeInScope(ASTDecl &scope) {
 void SharedState::addCaptureToScope(ASTDecl &scope, ASTDecl *captureDecl,
                                     Capture capture) {
   getImpl().capturesInScope[&scope].insert({capture.getSpelling(), capture});
-  if (captureDecl->getParentDecl() != scope.parentDecl) {
-    if (scope.getNearestDeclOfType<FnOp>())
-      addCaptureToScope(*scope.parentDecl, captureDecl, capture);
+  if (captureDecl->getParentDecl() != scope.getParentDecl()) {
+    if (scope.getNearestDeclOfType<DefASTDecl>())
+      addCaptureToScope(*scope.getParentDecl(), captureDecl, capture);
   }
 }
 
@@ -1899,53 +1893,6 @@ bool SharedState::captureInstanceExistsInScope(ASTDecl &scope,
     return false;
   auto capturePtr = ptr->second.find(spelling);
   return capturePtr != ptr->second.end();
-}
-
-ClosureParamCaptures *SharedState::getClosureParamCapturesForOp(Operation *op) {
-  auto ptr = getImpl().closureParamCaptures.find(op);
-  if (ptr == getImpl().closureParamCaptures.end())
-    return nullptr;
-  return &ptr->second;
-}
-
-ArrayRef<ClosureParamCapture>
-SharedState::lookupClosureCaptureFromOp(Operation *startOp,
-                                        StringAttr closureName) {
-  auto lookup = [&](Operation *op) -> ArrayRef<ClosureParamCapture> {
-    if (ClosureParamCaptures *captures = getClosureParamCapturesForOp(op)) {
-      auto ptr = captures->find(closureName);
-      if (ptr != captures->end())
-        return ptr->second;
-    }
-    return {};
-  };
-
-  StructDeclOp structScope;
-  for (Operation *op = startOp; op; op = op->getParentOp()) {
-    if (isa<FnOp>(op)) {
-      if (ArrayRef<ClosureParamCapture> captures = lookup(op);
-          !captures.empty())
-        return captures;
-    } else if (auto structOp = dyn_cast<StructDeclOp>(op)) {
-      structScope = structScope ? structScope : structOp;
-    }
-  }
-  if (structScope)
-    return lookup(structScope);
-  return {};
-}
-
-void SharedState::setClosureParamCaptures(
-    ASTDecl &functionDecl, ClosureParamCaptures closureParamCaptures) {
-  getImpl().closureParamCaptures[functionDecl.getIfOperation()] =
-      std::move(closureParamCaptures);
-}
-
-void SharedState::addClosureParamCaptures(
-    ASTDecl &functionDecl, StringAttr closureName,
-    SmallVector<ClosureParamCapture> captures) {
-  getImpl().closureParamCaptures[functionDecl.getIfOperation()][closureName] =
-      std::move(captures);
 }
 
 //===----------------------------------------------------------------------===//
@@ -2118,6 +2065,12 @@ void SharedState::notifyListenerOnVariableDecl(ASTDecl &decl,
     parserListener->onVariableDecl(&decl, identifierLoc);
 }
 
+void SharedState::notifyListenerOnDeclReplaced(ASTDecl &oldDecl,
+                                               ASTDecl &newDecl) {
+  if (parserListener)
+    parserListener->onDeclReplaced(&oldDecl, &newDecl);
+}
+
 void SharedState::notifyListenerOnRef(ArrayRef<ASTDecl *> decls,
                                       StringRef spelling, SMLoc loc) {
   if (!loc.isValid())
@@ -2130,6 +2083,13 @@ void SharedState::notifyListenerOnRef(ArrayRef<ASTDecl *> decls,
                                       StringRef spelling, SourceRange range) {
   if (isListenerInterestedInLoc(parserListener, range.getStart()))
     parserListener->onRef(decls, spelling, diags.convertToSMRange(range));
+}
+
+void SharedState::notifyListenerOnMatchMissingCases(llvm::SMRange matchRange,
+                                                    SMLoc insertLoc,
+                                                    StringRef arms) {
+  if (isListenerInterestedInLoc(parserListener, matchRange.Start))
+    parserListener->onMatchMissingCases(matchRange, insertLoc, arms);
 }
 
 /// Return the location of the identifier in the given expression.
@@ -2210,13 +2170,12 @@ void SharedState::notifyListenerOnParameterBinding(ArrayRef<ASTDecl *> decls,
 
 /// These two methods are used to memoize whether a type is implicitly
 /// convertible to another type, which includes overload resolution etc.
-std::optional<bool> SharedState::getCachedImplicitConvertibility(ASTType from,
-                                                                 ASTType to) {
+TriBool SharedState::getCachedImplicitConvertibility(ASTType from, ASTType to) {
   DenseMap<std::pair<Type, Type>, bool> &cache =
       getImpl().cachedImplicitConvertibility;
   auto it = cache.find({from, to});
   if (it == cache.end())
-    return {};
+    return TriBool::unknown();
 
 #ifndef NDEBUG
   // If this is the 64th convertibility hit, allow it to fail so we can detect
@@ -2224,9 +2183,9 @@ std::optional<bool> SharedState::getCachedImplicitConvertibility(ASTType from,
   // a small bit a paranoia to make it possible to track down subtle bugs that
   // may happen in the future.
   if ((cache.size() & 63) == 0)
-    return {};
+    return TriBool::unknown();
 #endif
-  return it->second;
+  return TriBool::fromBool(it->second);
 }
 void SharedState::cacheImplicitConvertibility(ASTType from, ASTType to,
                                               bool isConvertible) {
@@ -2242,14 +2201,14 @@ void SharedState::cacheImplicitConvertibility(ASTType from, ASTType to,
 }
 
 /// These two methods memoize assumption-free nominal trait-conformance results.
-std::optional<bool>
-SharedState::getCachedNominalConformance(const ASTDecl *decl, TraitType trait,
-                                         ASTType concreteType) {
+TriBool SharedState::getCachedNominalConformance(const ASTDecl *decl,
+                                                 TraitType trait,
+                                                 ASTType concreteType) {
   DenseMap<std::tuple<const ASTDecl *, Type, Type>, bool> &cache =
       getImpl().nominalConformanceCache;
   auto it = cache.find({decl, Type(trait), Type(concreteType)});
   if (it == cache.end())
-    return {};
+    return TriBool::unknown();
 
 #ifndef NDEBUG
   // Paranoia (mirrors the convertibility cache above): whenever the cache size
@@ -2257,9 +2216,9 @@ SharedState::getCachedNominalConformance(const ASTDecl *decl, TraitType trait,
   // store-side assert can catch the cache drifting from ground truth if the
   // result ever starts depending on state not in the key.
   if ((cache.size() & 63) == 0)
-    return {};
+    return TriBool::unknown();
 #endif
-  return it->second;
+  return TriBool::fromBool(it->second);
 }
 void SharedState::cacheNominalConformance(const ASTDecl *decl, TraitType trait,
                                           ASTType concreteType, bool conforms) {
@@ -2407,8 +2366,9 @@ struct BuiltinFunctionFolder {
 
       // We need the struct decl to get the fields.
       auto structType = cast<LIT::StructType>(whole.getType());
-      auto structDecl = ASTType(structType).getDecl(shared);
-      auto structOp = cast<StructDeclOp>(structDecl->getIfOperation());
+      auto *structDecl =
+          cast<StructASTDecl>(ASTType(structType).getDecl(shared));
+      StructDeclOp structOp = structDecl->getOp();
 
       // Rebuild the struct with the new value in the field.
       SmallVector<std::tuple<StringAttr, TypedAttr>> fields;
@@ -2759,8 +2719,8 @@ FailureOr<TypedAttr> BuiltinFunctionFolder::fold(Operation &op) {
         ASTType(eltType).isTrivialRegisterType(decl->getLoc(), shared)) {
       // A struct with no fields never get initialized, so it has to start as a
       // pre-built value.
-      auto structOp = dyn_cast_or_null<StructDeclOp>(decl->getIfOperation());
-      if (structOp && structOp.getFieldDecls().empty())
+      auto *structDecl = dyn_cast<StructASTDecl>(decl);
+      if (structDecl && structDecl->getOp().getFieldDecls().empty())
         varDeclSoFar[varDecl] = LIT::getEmptyStructValue(eltType);
       else
         varDeclSoFar[varDecl] = UninitMemAttr::get(eltType);
@@ -2924,10 +2884,8 @@ TypedAttr SharedState::foldInlineBuiltinFunction(ArrayRef<TypedAttr> operands,
   operands = operands.drop_front();
 
   auto &resolver = getDeclResolver();
-  ASTDecl *calleeDecl = resolver.getDeclForFuncSymbol(symCst.getSymbol());
-  assert(llvm::isa_and_present<FnOp>(calleeDecl->getIfOperation()) &&
-         "callee isn't known?");
-  auto fnOp = cast_or_null<FnOp>(calleeDecl->getIfOperation());
+  DefASTDecl *calleeDecl = resolver.getDeclForFuncSymbol(symCst.getSymbol());
+  auto fnOp = calleeDecl->getOp();
   if (inlineLevelOrAutomatic(fnOp.getInlineLevel()) !=
       InlineLevel::AlwaysBuiltin) {
     folder.emitError(callLoc) << "only supports calls to other "

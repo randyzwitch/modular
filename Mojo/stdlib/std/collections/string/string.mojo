@@ -23,11 +23,9 @@ from std.collections.string.string_span import (
     CodepointSliceIter,
     GraphemeIndicesIter,
     GraphemeSliceIter,
-    _to_string_list,
-    _unsafe_strlen,
 )
 from std.builtin.builtin_slice import ContiguousSlice
-from std.hashlib.hasher import Hasher
+from std.hash.hasher import Hasher
 from std.reflection import call_location
 from std.format.tstring import TString
 from std.format._utils import (
@@ -36,10 +34,11 @@ from std.format._utils import (
     _FlushingWriteBuffer,
 )
 from std.os import PathLike, abort
+from std._plugin import CurrentPlugin
 from std.atomic import Atomic, Ordering, fence
 from std.sys import size_of, bit_width_of
 from std.ffi import c_char, CStringSpan
-from std.sys.info import is_32bit, is_apple_gpu
+from std.sys.info import is_32bit
 
 from std.bit import count_leading_zeros
 from std.memory import (
@@ -572,7 +571,7 @@ struct String(
         self = String(
             StringSlice(
                 unsafe_from_utf8=CStringSpan(
-                    unsafe_from_ptr=unsafe_from_utf8_ptr.unsafe_bitcast[Int8]()
+                    unsafe_from_ptr=unsafe_from_utf8_ptr
                 )
             )
         )
@@ -591,7 +590,9 @@ struct String(
         self = String(
             StringSlice(
                 unsafe_from_utf8=CStringSpan(
-                    unsafe_from_ptr=unsafe_from_utf8_ptr.unsafe_bitcast[Int8]()
+                    unsafe_from_ptr=unsafe_from_utf8_ptr.unsafe_bitcast[
+                        c_char
+                    ]()
                 )
             )
         )
@@ -695,9 +696,9 @@ struct String(
     @inline(.nodebug)
     def _add_ref(mut self):
         """Atomically increment the refcount."""
-        comptime if is_apple_gpu():
-            # No-op: heap-string refcounting is unsupported on Apple GPU.
-            # See MSTDL-2907.
+        comptime if not CurrentPlugin.supports_atomic_rmw[DType.int]:
+            # No-op where the refcount's atomics don't lower (64-bit on
+            # Metal). See MSTDL-2907.
             return
         if self._capacity_or_data & Self.FLAG_IS_REF_COUNTED:
             # See `ArcPointer`'s refcount implementation for more details on the
@@ -708,9 +709,9 @@ struct String(
     def _drop_ref(mut self):
         """Atomically decrement the refcount and deallocate self if the result
         hits zero."""
-        comptime if is_apple_gpu():
-            # No-op: heap-string refcounting is unsupported on Apple GPU.
-            # See MSTDL-2907.
+        comptime if not CurrentPlugin.supports_atomic_rmw[DType.int]:
+            # No-op where the refcount's atomics don't lower (64-bit on
+            # Metal). See MSTDL-2907.
             return
         # If indirect or inline we don't need to do anything.
         if self._capacity_or_data & Self.FLAG_IS_REF_COUNTED:
@@ -721,7 +722,7 @@ struct String(
                 dealloc(
                     ThinAllocation(unsafe_owned_ptr=ptr).unsafe_with_layout(
                         Layout[Byte](
-                            count=self.capacity_bytes() + Self.REF_COUNT_SIZE
+                            length=self.capacity_bytes() + Self.REF_COUNT_SIZE
                         )
                     )
                 )
@@ -730,7 +731,7 @@ struct String(
     def _alloc(capacity: Int) -> Pointer[Byte, MutUntrackedOrigin]:
         """Allocate space for a new out-of-line string buffer."""
         var ptr = alloc(
-            Layout[Byte](count=capacity + Self.REF_COUNT_SIZE)
+            Layout[Byte](length=capacity + Self.REF_COUNT_SIZE)
         ).unsafe_leak()
 
         # Initialize the Atomic refcount into the header.

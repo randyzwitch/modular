@@ -690,7 +690,8 @@ static void dropEmptyStructArguments(LLVM::LLVMFuncOp &func,
 /// Attribute stamped onto llvm.func ops that were converted from kgen.func ops
 /// with the abi("C") effect. Used by ConvertKGENCall to identify C-ABI
 /// callees regardless of whether the callee was converted before or after the
-/// call site.
+/// call site. Its value holds the signedness of each result, which the LLVM
+/// types no longer carry, for the C ABI extension of a narrow integer result.
 static constexpr StringLiteral kCABIFuncAttr = "kgen.c_abi";
 
 /// Returns true if the callee identified by `sym` has the abi("C") effect.
@@ -761,8 +762,13 @@ public:
 
     // Mark abi("C") functions so ConvertKGENCall can identify them via
     // symbol lookup regardless of conversion order.
-    if (func.getFuncTypeGenerator().getBody().getFnEffects().isCABI())
-      funcOp->setAttr(kCABIFuncAttr, b.getUnitAttr());
+    if (func.getFuncTypeGenerator().getBody().getFnEffects().isCABI()) {
+      funcOp->setAttr(kCABIFuncAttr,
+                      b.getDenseBoolArrayAttr(llvm::map_to_vector(
+                          func.getFunctionType().getResults(), [](Type type) {
+                            return isSignedIntegerScalar(type);
+                          })));
+    }
 
     // And move the func's body into the new function.
     if (!func.isExternal()) {
@@ -825,33 +831,21 @@ struct ConvertKGENCall : public ConvertPOPToLLVMPattern<CallOp> {
       CABICallHelper cabi(getTypeConverter(), getContext(), op.getOperation());
       Location loc = op.getLoc();
       Type origRetTy = types.empty() ? Type{} : types.front();
-      auto prep =
-          cabi.prepareCall(mlir::ValueRange(filteredOperands).getTypes(),
-                           filteredOperands, origRetTy, loc, rewriter);
+      SmallVector<Type> filteredOrigTypes;
+      for (auto [orig, converted] :
+           llvm::zip_equal(op.getOperandTypes(), adaptor.getOperands())) {
+        if (!isEmptyType(converted.getType()))
+          filteredOrigTypes.push_back(orig);
+      }
+      auto prep = cabi.prepareCall(filteredOrigTypes, filteredOperands,
+                                   origRetTy, loc, rewriter);
       LLVM::CallOp llvmCall = LLVM::CallOp::create(
           rewriter, loc, prep.signature, flatSymbol, prep.callArgs);
-      CABICallHelper::applySRetAttrIfNeeded(llvmCall, origRetTy, prep.usesSRet,
-                                            rewriter);
-      cabi.applyByvalAttrsToCall(llvmCall, prep.argClass,
-                                 mlir::ValueRange(filteredOperands).getTypes(),
-                                 prep.usesSRet, rewriter);
-      // A tail call is only safe when the callee does not write through any
-      // pointer that lives in the caller's stack frame.  The sret alloca
-      // created by prepareCall lives in the caller's frame, so a tail call
-      // would free that frame before the callee stores its return value,
-      // producing a silent memory corruption (MOCO-3841).  Suppress the tail
-      // marker whenever sret is in use; non-sret returns are register-passed
-      // and remain eligible for tail-call optimization.
-      if (!prep.usesSRet)
-        applyTailKind(llvmCall, op.getTailKind());
-      if (op.getNumResults() == 0) {
+      if (Value result =
+              cabi.finishCall(llvmCall, prep, op.getTailKind(), loc, rewriter))
+        rewriter.replaceOp(op, result);
+      else
         rewriter.eraseOp(op);
-        return success();
-      }
-      Value rawResult = prep.usesSRet ? Value{} : llvmCall.getResult();
-      rewriter.replaceOp(op, cabi.extractReturn(prep.retClass, rawResult,
-                                                prep.sretPtr, origRetTy, loc,
-                                                rewriter));
       return success();
     }
 
@@ -1326,9 +1320,15 @@ void LowerKGENToLLVMPass::runOnOperation() {
     auto abiHandler =
         createCABIInfo(typeConverter.getTarget().getTriple(), &getContext(),
                        static_cast<const LLVMDataLayout &>(typeConverter));
-    for (auto func : theModule.getOps<LLVM::LLVMFuncOp>())
-      if (func->hasAttr(kCABIFuncAttr))
-        processCABIFunctionDefinition(func, *abiHandler);
+    for (auto func : theModule.getOps<LLVM::LLVMFuncOp>()) {
+      auto resultSigns = func->getAttrOfType<DenseBoolArrayAttr>(kCABIFuncAttr);
+      if (!resultSigns)
+        continue;
+      // Several results are packed into a struct, which is never extended.
+      bool isResultSigned =
+          resultSigns.size() == 1 && resultSigns.asArrayRef().front();
+      processCABIFunctionDefinition(func, *abiHandler, isResultSigned);
+    }
   }
 
   // Convert the debug info within the IR.

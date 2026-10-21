@@ -23,7 +23,8 @@ Usage::
 
 Layout:
 
-- :mod:`.spmd_ops` -- ``per_shard_dispatch`` engine and per-op functions.
+- :mod:`.dispatch` -- :func:`call_on_mesh`, which runs a function per device.
+- :mod:`.spmd_ops` -- per-op functions and their sharding rules.
 - :mod:`.collective_ops` -- collectives and ``transfer_to``.
 - :mod:`.creation_ops` -- ``full`` / ``ones`` / ``zeros`` and friends.
 - :func:`custom` / :func:`inplace_custom` live here because they
@@ -50,9 +51,11 @@ from max.graph import DeviceRef, Graph, TensorType, Type, ops
 
 from .collective_ops import (
     allgather,
+    allgather_rms_norm,
     allreduce_sum,
     distributed_broadcast,
     reduce_scatter,
+    reduce_scatter_rms_norm,
     transfer_to,
 )
 from .creation_ops import (
@@ -69,17 +72,18 @@ from .creation_ops import (
     ones,
     ones_like,
     range,
+    shape_to_tensor,
     uniform,
     uniform_like,
     zeros,
     zeros_like,
 )
+from .dispatch import call_on_mesh
 from .print import print
 from .spmd_ops import (
     abs,
     acos,
     add,
-    any_distributed,
     argmax,
     argmin,
     argsort,
@@ -133,7 +137,6 @@ from .spmd_ops import (
     logical_or,
     logical_xor,
     logsoftmax,
-    map_tensors,
     masked_scatter,
     matmul,
     max,
@@ -148,7 +151,6 @@ from .spmd_ops import (
     not_equal,
     outer,
     pad,
-    per_shard_dispatch,
     permute,
     pow,
     prod,
@@ -174,6 +176,7 @@ from .spmd_ops import (
     scatter_nd_max,
     scatter_nd_min,
     scatter_nd_mul,
+    side_stream,
     sigmoid,
     silu,
     sin,
@@ -186,9 +189,7 @@ from .spmd_ops import (
     sub,
     sum,
     tanh,
-    tensor_to_layout,
     tile,
-    to_tensors,
     top_k,
     transpose,
     trunc,
@@ -205,8 +206,8 @@ __all__ = [
     "acos",
     "add",
     "allgather",
+    "allgather_rms_norm",
     "allreduce_sum",
-    "any_distributed",
     "arange",
     "argmax",
     "argmin",
@@ -219,6 +220,7 @@ __all__ = [
     "broadcast_to",
     "buffer_store",
     "buffer_store_slice",
+    "call_on_mesh",
     "cast",
     "ceil",
     "chunk",
@@ -274,7 +276,6 @@ __all__ = [
     "logical_or",
     "logical_xor",
     "logsoftmax",
-    "map_tensors",
     "masked_scatter",
     "matmul",
     "max",
@@ -293,7 +294,6 @@ __all__ = [
     "ones_like",
     "outer",
     "pad",
-    "per_shard_dispatch",
     "permute",
     "pow",
     "print",
@@ -302,6 +302,7 @@ __all__ = [
     "range",
     "rebind",
     "reduce_scatter",
+    "reduce_scatter_rms_norm",
     "relu",
     "repeat_interleave",
     "reshape",
@@ -323,6 +324,8 @@ __all__ = [
     "scatter_nd_max",
     "scatter_nd_min",
     "scatter_nd_mul",
+    "shape_to_tensor",
+    "side_stream",
     "sigmoid",
     "silu",
     "sin",
@@ -335,9 +338,7 @@ __all__ = [
     "sub",
     "sum",
     "tanh",
-    "tensor_to_layout",
     "tile",
-    "to_tensors",
     "top_k",
     "transfer_to",
     "transpose",
@@ -396,7 +397,7 @@ def custom(
     device: Device | DeviceRef,
     values: Sequence[Any],
     out_types: Sequence[Type[Any]],
-    parameters: Mapping[str, bool | int | str | DType] | None = None,
+    parameters: Mapping[str, bool | int | float | str | DType] | None = None,
     custom_extensions: str | Path | Sequence[str | Path] | None = None,
 ) -> list[Tensor]:
     """Calls a custom op, optionally loading custom Mojo extensions first.
@@ -433,7 +434,7 @@ def inplace_custom(
     device: Device | DeviceRef,
     values: Sequence[Any],
     out_types: Sequence[Type[Any]] | None = None,
-    parameters: dict[str, bool | int | str | DType] | None = None,
+    parameters: Mapping[str, bool | int | float | str | DType] | None = None,
     custom_extensions: str | Path | Sequence[str | Path] | None = None,
 ) -> list[Tensor]:
     """Calls an in-place custom op that mutates one or more of its inputs.

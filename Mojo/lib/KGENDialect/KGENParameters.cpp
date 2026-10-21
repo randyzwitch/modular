@@ -16,6 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Mojo/KGENDialect/KGENParameters.h"
+#include "Mojo/KGENDialect/CompilerCaches.h"
 #include "Mojo/KGENDialect/KGENAttrs.h"
 #include "Mojo/KGENDialect/KGENInterfaces.h"
 #include "Mojo/KGENDialect/KGENOps.h"
@@ -104,6 +105,26 @@ Attribute IndexDepthAdjuster::tryReplace(Attribute attr, size_t depth) {
   }
   return nullptr;
 }
+
+template <typename BaseT>
+BaseT IndexDepthAdjuster::replaceCached(BaseT value) {
+  if (!value)
+    return value;
+  CompilerCaches *caches = CompilerCaches::get(value.getContext());
+  if (!caches)
+    return IndexParameterReplacer<IndexDepthAdjuster>::replace(value);
+  std::tuple<const void *, int64_t, unsigned> key(
+      value.getAsOpaquePointer(), adjustDepth, onlyAdjustIndexRef);
+  if (const void *hit = caches->depthAdjust.lookup(key))
+    return BaseT::getFromOpaquePointer(hit);
+  BaseT result = IndexParameterReplacer<IndexDepthAdjuster>::replace(value);
+  if (result)
+    caches->depthAdjust.insert(key, result.getAsOpaquePointer());
+  return result;
+}
+
+template Attribute IndexDepthAdjuster::replaceCached(Attribute);
+template Type IndexDepthAdjuster::replaceCached(Type);
 
 //===----------------------------------------------------------------------===//
 // ParameterCollector
@@ -245,16 +266,18 @@ void ParameterCollector::collectUsesFromAttrImpl(
   bool hasNestedCtxEvalExpr = false;
   size_t nestedRequiredDepth = 0;
 
-  // Recursively check for any nested types/attributes, e.g. the elements of an
-  // array attribute.
   attr.walkImmediateSubElements(
       [&](Attribute attr) {
+        size_t innerRequiredDepth = 0;
         collectUsesFromAttr(attr, uses, hasNestedCtxEvalExpr,
-                            nestedRequiredDepth);
+                            innerRequiredDepth);
+        nestedRequiredDepth = std::max(nestedRequiredDepth, innerRequiredDepth);
       },
       [&](Type type) {
+        size_t innerRequiredDepth = 0;
         collectUsesFromType(type, uses, hasNestedCtxEvalExpr,
-                            nestedRequiredDepth);
+                            innerRequiredDepth);
+        nestedRequiredDepth = std::max(nestedRequiredDepth, innerRequiredDepth);
       });
 
   // If the attribute had no uses, remember that so we don't have to re-scan it
@@ -315,12 +338,14 @@ void ParameterCollector::collectUsesFromTypesImpl(
   // function type, types like !kgen.scalar<ty> etc.
   type.walkImmediateSubElements(
       [&](Attribute attr) {
-        collectUsesFromAttr(attr, uses, hasNestedConstExpr,
-                            nestedRequiredDepth);
+        size_t innerRequiredDepth = 0;
+        collectUsesFromAttr(attr, uses, hasNestedConstExpr, innerRequiredDepth);
+        nestedRequiredDepth = std::max(nestedRequiredDepth, innerRequiredDepth);
       },
       [&](Type type) {
-        collectUsesFromType(type, uses, hasNestedConstExpr,
-                            nestedRequiredDepth);
+        size_t innerRequiredDepth = 0;
+        collectUsesFromType(type, uses, hasNestedConstExpr, innerRequiredDepth);
+        nestedRequiredDepth = std::max(nestedRequiredDepth, innerRequiredDepth);
       });
 
   // If the type had parameter uses or constant expressions, don't consider it

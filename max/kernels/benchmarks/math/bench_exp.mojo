@@ -27,7 +27,7 @@ from std.benchmark import (
     ThroughputMeasure,
     keep,
 )
-from layout import Coord, TileTensor, row_major
+from layout import TileTensor, row_major
 from std.builtin.range import _StridedRange
 from std.compile import compile_info
 from std.memory import (
@@ -79,11 +79,11 @@ def bench_unary[
 ](mut m: Bench, size: Int, op_name: String) raises:
     comptime alignment = Alignment.of_bytes[64]()
     var input_ptr_alloc = alloc(
-        AllocLayout[Scalar[dtype], alignment=alignment](count=size)
+        AllocLayout[Scalar[dtype], alignment=alignment](length=size)
     ).into_managed()
     var input_ptr = input_ptr_alloc.unsafe_ptr()
     var output_ptr_alloc = alloc(
-        AllocLayout[Scalar[dtype], alignment=alignment](count=size)
+        AllocLayout[Scalar[dtype], alignment=alignment](length=size)
     ).into_managed()
     var output_ptr = output_ptr_alloc.unsafe_ptr()
 
@@ -95,8 +95,8 @@ def bench_unary[
     def bench(mut b: Bencher, size: Int) raises {imm}:
         def iter_fn() {imm}:
             apply[func](
-                TileTensor(input_ptr, row_major(Coord(_ri(size)))),
-                TileTensor(output_ptr, row_major(Coord(_ri(size)))),
+                TileTensor(input_ptr, row_major(_ri(size))),
+                TileTensor(output_ptr, row_major(_ri(size))),
             )
             keep(output_ptr)
 
@@ -138,14 +138,14 @@ def ldexp2kf_opt[
     var u = bitcast[dtype, simd_width](m << 23)
     var x = x_in * u * u * u * u
     #   u = intBitsToFloat(((int32_t)(q + 0x7f)) << 23);
-    var xu = ((q + SIMD[.int32, simd_width](0x7F)).cast[.int32]()) << 23
+    var xu = (q + 0x7F) << 23
     return x * xu.cast[dtype]()
 
 
 def pow2if[
     simd_width: SIMDLength
 ](q: SIMD[.int32, simd_width]) -> SIMD[.float32, simd_width]:
-    var x = (((q + SIMD[.int32, simd_width](0x7F)).cast[.int32]())) << 23
+    var x = (q + 0x7F) << 23
     return bitcast[.float32, simd_width](x)
 
 
@@ -270,7 +270,7 @@ def exp_mojo_opt[
 
     var r = k.fma(neg_ln2, xc)
     # var r = k.fma(-L2Lf, k.fma(-L2Uf, xc))
-    var taylor_result = _exp_taylor0(r.cast[im_type]()).cast[dtype]()
+    var taylor_result = _exp_taylor0(r).cast[dtype]()
     var expr = ldexp(taylor_result, k.cast[.int32]())
     return expr
     # var val1 = (expr > min_val).select(expr, SIMD[dtype,simd_width](0))

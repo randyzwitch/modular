@@ -14,11 +14,14 @@
 import io
 import json
 import logging
+import queue
 import re
 from contextlib import contextmanager
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
+from max.nn.kv_cache.metrics import KVCacheMetrics
+from max.pipelines.kv_cache.kv_connector import BlockCount, ByteCount
 from max.pipelines.lib.vision_encoder_cache import (
     VideoEncoderMetrics,
     VisionEncoderMetrics,
@@ -463,7 +466,7 @@ def test_dkv_read_counts_follow_the_console_clause_on_a_write_only_batch() -> (
 
 
 def test_dkv_peer_counters_report_zero_while_a_tier_is_attached() -> None:
-    """An attached tier that pulled from no peer still reports all five zeros.
+    """An attached tier that pulled from no peer still reports all its zeros.
 
     This is the whole point of the counters: a flat zero says no cache hint
     reached the connector, which is a different fault from hints arriving and
@@ -480,9 +483,14 @@ def test_dkv_peer_counters_report_zero_while_a_tier_is_attached() -> None:
     mock_metrics.dkv_peer_loads.assert_called_once_with(0)
     mock_metrics.dkv_peer_load_failures.assert_called_once_with(0)
     mock_metrics.dkv_hints_rejected.assert_called_once_with(0)
+    mock_metrics.dkv_peer_transfer_failures.assert_called_once_with(0)
+    mock_metrics.dkv_peer_metadata_refreshes.assert_called_once_with(0)
+    mock_metrics.dkv_peer_metadata_refresh_failures.assert_called_once_with(0)
 
     extra = metrics.to_log_extra()
     assert extra["dkv_peer_loads"] == 0
+    assert extra["dkv_peer_transfer_failures"] == 0
+    assert extra["dkv_peer_metadata_refresh_failures"] == 0
     assert extra["dkv_hints_rejected"] == 0
 
     # the console line stays quiet, since there is nothing to say about peers
@@ -506,7 +514,11 @@ def test_dkv_peer_counters_are_silent_without_a_tier() -> None:
 
 
 def test_dkv_peer_counters_carry_their_values_to_every_surface() -> None:
-    """A batch that pulled cross-node reports it on the line, log, and counters."""
+    """A batch that pulled cross-node reports it on the line, log, and counters.
+
+    The per-call maps reach the log and the counters too, the labels that
+    moved and no others.
+    """
     metrics = _make_metrics(
         dkv_connected_clients=2,
         dkv_total_clients=2,
@@ -516,11 +528,21 @@ def test_dkv_peer_counters_carry_their_values_to_every_surface() -> None:
         dkv_peer_loads=3,
         dkv_peer_load_failures=4,
         dkv_hints_rejected=5,
+        dkv_peer_transfer_failures=7,
+        dkv_peer_metadata_refreshes=8,
+        dkv_peer_metadata_refresh_failures=9,
+        dkv_hints_rejected_by_reason={"chain_mismatch": 5, "unparseable": 0},
+        dkv_rpc_calls={"read_blocks": 3, "heartbeat": 0},
+        dkv_rpc_time_ms={"read_blocks": 2.5, "heartbeat": 0.0},
+        dkv_rpc_socket_wait_ms={"read_blocks": 0.5},
+        dkv_lock_waits={"prepare_load": 2, "offload": 0},
+        dkv_lock_wait_ms={"prepare_load": 1.25},
     )
 
     assert (
         "dKV peers: 3 loads (4 failed), 1 attaches (2 failed, 6 dropped), "
-        "5 hints rejected" in metrics.pretty_format()
+        "5 hints rejected, 7 transfers failed, "
+        "8 metadata refreshes (9 failed)" in metrics.pretty_format()
     )
 
     extra = metrics.to_log_extra()
@@ -530,6 +552,20 @@ def test_dkv_peer_counters_carry_their_values_to_every_surface() -> None:
     assert extra["dkv_peer_loads"] == 3
     assert extra["dkv_peer_load_failures"] == 4
     assert extra["dkv_hints_rejected"] == 5
+    assert extra["dkv_peer_transfer_failures"] == 7
+    assert extra["dkv_peer_metadata_refreshes"] == 8
+    assert extra["dkv_peer_metadata_refresh_failures"] == 9
+    assert {
+        k: v for k, v in extra.items() if "_rpc_" in k or "_lock_" in k
+    } == {
+        "dkv_rpc_calls_read_blocks": 3,
+        "dkv_rpc_time_ms_read_blocks": 2.5,
+        "dkv_rpc_socket_wait_ms_read_blocks": 0.5,
+        "dkv_lock_waits_prepare_load": 2,
+        "dkv_lock_wait_ms_prepare_load": 1.25,
+    }
+    assert extra["dkv_hints_rejected_chain_mismatch"] == 5
+    assert "dkv_hints_rejected_unparseable" not in extra
 
     with patch("max.serve.scheduler.utils.METRICS") as mock_metrics:
         metrics.publish_metrics()
@@ -540,6 +576,68 @@ def test_dkv_peer_counters_carry_their_values_to_every_surface() -> None:
     mock_metrics.dkv_peer_loads.assert_called_once_with(3)
     mock_metrics.dkv_peer_load_failures.assert_called_once_with(4)
     mock_metrics.dkv_hints_rejected.assert_called_once_with(5)
+    mock_metrics.dkv_peer_transfer_failures.assert_called_once_with(7)
+    mock_metrics.dkv_peer_metadata_refreshes.assert_called_once_with(8)
+    mock_metrics.dkv_peer_metadata_refresh_failures.assert_called_once_with(9)
+    mock_metrics.dkv_hints_rejected_by_reason.assert_called_once_with(
+        5, reason="chain_mismatch"
+    )
+    mock_metrics.dkv_rpc_calls.assert_called_once_with(3, op="read_blocks")
+    mock_metrics.dkv_rpc_time_ms.assert_called_once_with(2.5, op="read_blocks")
+    mock_metrics.dkv_rpc_socket_wait_ms.assert_called_once_with(
+        0.5, op="read_blocks"
+    )
+    mock_metrics.dkv_lock_waits.assert_called_once_with(2, entry="prepare_load")
+    mock_metrics.dkv_lock_wait_ms.assert_called_once_with(
+        1.25, entry="prepare_load"
+    )
+
+
+def test_dkv_per_call_counters_publish_one_series_per_label() -> None:
+    """Each per-call map publishes one increment per key that moved.
+
+    A zero increment changes no counter, so the zeros never leave the
+    scheduler thread.
+    """
+    metrics = _make_metrics(
+        dkv_connected_clients=1,
+        dkv_total_clients=1,
+        dkv_rpc_calls={"read_blocks": 3, "touch_blocks": 2, "heartbeat": 0},
+        dkv_rpc_time_ms={
+            "read_blocks": 2.5,
+            "touch_blocks": 4.0,
+            "heartbeat": 0.0,
+        },
+        dkv_rpc_socket_wait_ms={"read_blocks": 0.5, "touch_blocks": 0.0},
+        dkv_lock_waits={"poll_transfers": 6, "offload": 0},
+        dkv_lock_wait_ms={"poll_transfers": 1.25, "offload": 0.0},
+        dkv_hints_rejected_by_reason={"chain_mismatch": 7, "unparseable": 0},
+    )
+
+    with patch("max.serve.scheduler.utils.METRICS") as mock_metrics:
+        metrics.publish_metrics()
+
+    mock_metrics.dkv_rpc_calls.assert_has_calls(
+        [call(3, op="read_blocks"), call(2, op="touch_blocks")], any_order=True
+    )
+    assert mock_metrics.dkv_rpc_calls.call_count == 2
+    mock_metrics.dkv_rpc_time_ms.assert_has_calls(
+        [call(2.5, op="read_blocks"), call(4.0, op="touch_blocks")],
+        any_order=True,
+    )
+    assert mock_metrics.dkv_rpc_time_ms.call_count == 2
+    mock_metrics.dkv_rpc_socket_wait_ms.assert_called_once_with(
+        0.5, op="read_blocks"
+    )
+    mock_metrics.dkv_lock_waits.assert_called_once_with(
+        6, entry="poll_transfers"
+    )
+    mock_metrics.dkv_lock_wait_ms.assert_called_once_with(
+        1.25, entry="poll_transfers"
+    )
+    mock_metrics.dkv_hints_rejected_by_reason.assert_called_once_with(
+        7, reason="chain_mismatch"
+    )
 
 
 def test_dkv_peer_clause_appears_on_rejected_hints_alone() -> None:
@@ -553,6 +651,21 @@ def test_dkv_peer_clause_appears_on_rejected_hints_alone() -> None:
     )
 
     assert "7 hints rejected" in metrics.pretty_format()
+
+
+def test_dkv_peer_clause_appears_on_peer_transfer_failures_alone() -> None:
+    """A stale peer's failed reads print the clause with nothing else moving.
+
+    The failure no longer degrades the connector, so the line is the only
+    console trace it leaves.
+    """
+    metrics = _make_metrics(
+        dkv_connected_clients=1,
+        dkv_total_clients=1,
+        dkv_peer_transfer_failures=3,
+    )
+
+    assert "3 transfers failed" in metrics.pretty_format()
 
 
 def test_to_log_extra_required_fields() -> None:
@@ -1549,6 +1662,10 @@ def test_scheduler_overlap_attributes_execution_metrics_to_completed_batch() -> 
         # the CE label rather than the enqueued TG batch's.
         assert [bt for _, bt in recorder.terminated_calls] == ["CE"]
         assert recorder.creation_calls[-1][1] == "TG"
+        # The CE result names the pass that produced it, not this one.
+        responses = scheduler.response_queue
+        assert isinstance(responses, queue.Queue)
+        assert [r.batch_id for r in responses.queue[0].values()] == [0]
 
 
 # ---------------------------------------------------------------------------
@@ -1882,10 +1999,10 @@ def test_dkv_read_blocks_publishes_outside_the_cache_hit_clause() -> None:
     It is a per-window delta that ``take_metrics`` clears after every batch,
     so a window published under any other batch type would lose its count for
     good. That matters because a load posted on a CE iteration can have its
-    blocks accounted on a later ``wait_for_loads``, which also runs on TG
-    iterations: under the old placement those blocks were dropped, letting the
-    counter read *below* ``cache.hits{tier=external}`` despite being
-    documented as an upper bound on it.
+    blocks accounted on a later drain, which also runs on TG iterations: under
+    the old placement those blocks were dropped, letting the counter read
+    *below* ``cache.hits{tier=external}`` despite being documented as an upper
+    bound on it.
     """
     metrics = _make_metrics(
         batch_type=BatchType.TG,
@@ -1948,3 +2065,86 @@ def test_create_sums_the_external_share_across_admissions() -> None:
     assert metrics.cache_hit_external_tokens == 30
     # The device share is the complement, and the two partition the hit total.
     assert metrics.cache_hit_tokens - metrics.cache_hit_external_tokens == 50
+
+
+def test_batch_metrics_create_reports_shared_tiers_once_under_dp() -> None:
+    """Host and disk tiers are one pool shared by every DP replica, so their
+    capacity is reported once, not ``data_parallel_degree`` times over.
+
+    Regression: summing the per-replica accessor over the shared pool reported
+    a 250 GiB host tier as 500 GiB at ``data_parallel_degree=2``.
+    """
+    kv_cache = MagicMock()
+    kv_cache.block_count.return_value = BlockCount(free=60, total=100)
+    kv_cache.pressure_pct.return_value = 40.0
+    kv_cache.host_byte_count.return_value = ByteCount(free=750, total=1000)
+    kv_cache.disk_byte_count.return_value = ByteCount(free=4000, total=5000)
+    kv_cache.take_metrics_aggregated.return_value = KVCacheMetrics()
+
+    metrics = BatchMetrics.create(
+        sch_config=_mock_sch_config(dp=2),
+        inputs=_mock_inputs(batch_size=2, batch_type=BatchType.TG),
+        kv_cache=kv_cache,
+        batch_creation_time_s=0.001,
+        batch_execution_time_s=0.1,
+        num_pending_reqs=0,
+        num_terminated_reqs=0,
+        total_preemption_count=0,
+    )
+
+    # Device blocks really are partitioned, so they still sum per replica.
+    assert metrics.total_kv_blocks == 200
+    assert metrics.total_host_kv_bytes == 1000
+    assert metrics.used_host_kv_pct == 0.25
+    assert metrics.total_disk_kv_bytes == 5000
+    assert metrics.used_disk_kv_pct == 0.2
+
+
+def test_create_carries_connector_load_failures_through() -> None:
+    """The managers' failed-load count reaches the batch, with no host tier.
+
+    dKV reports no host tier, so a count read only alongside the host tier's
+    would never leave a dKV deployment.
+    """
+    kv_cache = MagicMock()
+    kv_cache.block_count.return_value = BlockCount(free=60, total=100)
+    kv_cache.pressure_pct.return_value = 40.0
+    kv_cache.host_byte_count.return_value = ByteCount(free=0, total=0)
+    kv_cache.disk_byte_count.return_value = ByteCount(free=0, total=0)
+    kv_cache.take_metrics_aggregated.return_value = KVCacheMetrics(
+        connector_load_failures=2
+    )
+
+    metrics = BatchMetrics.create(
+        sch_config=_mock_sch_config(),
+        inputs=_mock_inputs(batch_size=1, batch_type=BatchType.TG),
+        kv_cache=kv_cache,
+        batch_creation_time_s=0.001,
+        batch_execution_time_s=0.1,
+        num_pending_reqs=0,
+        num_terminated_reqs=0,
+        total_preemption_count=0,
+    )
+
+    assert metrics.connector_load_failures == 2
+
+
+def test_connector_load_failures_reach_the_log_and_the_counter() -> None:
+    """Published on its own guard, not the host tier's, which dKV never sets."""
+    metrics = _make_metrics(connector_load_failures=3, total_host_kv_bytes=0)
+
+    with patch("max.serve.scheduler.utils.METRICS") as mock_metrics:
+        metrics.publish_metrics()
+
+    mock_metrics.cache_connector_load_failures.assert_called_once_with(3)
+    assert metrics.to_log_extra()["connector_load_failures"] == 3
+
+
+def test_connector_load_failures_are_silent_while_none_fail() -> None:
+    metrics = _make_metrics()
+
+    with patch("max.serve.scheduler.utils.METRICS") as mock_metrics:
+        metrics.publish_metrics()
+
+    mock_metrics.cache_connector_load_failures.assert_not_called()
+    assert "connector_load_failures" not in metrics.to_log_extra()

@@ -91,11 +91,13 @@ class JSONSchemaFormat(BaseModel):
     require_object_root: bool = False
     """Require the schema root to produce an object-typed value, coercing an unconstrained root to an empty open object."""
     reject_unsupported: bool = False
-    """Reject unenforceable schema keywords rather than fall back to unconstrained decoding."""
+    """Whether to raise an error during grammar compilation when the schema cannot be enforced."""
     strict_mode: bool = True
     """Disallow properties and items not specified in the schema."""
     xml_tag_prefix: str = ""
     """Prefix emitted before every XML open and close tag."""
+    xml_require_paired_tags: bool = False
+    """Require declared, paired XML member tags instead of variable keys."""
     any_whitespace: bool = True
     """Allow any whitespace between JSON elements."""
     indent: Optional[int] = None

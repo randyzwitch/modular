@@ -348,34 +348,17 @@ struct CallIndirectOpConversion
       Type origRetTy = op.getNumResults() > 0 ? resultType : Type{};
 
       auto prep =
-          cabi.prepareCall(adaptor.getArguments().getTypes(),
-                           adaptor.getArguments(), origRetTy, loc, rewriter);
+          cabi.prepareCall(op.getArguments().getTypes(), adaptor.getArguments(),
+                           origRetTy, loc, rewriter);
       // Insert the indirect call target.
       prep.callArgs.insert(prep.callArgs.begin(), adaptor.getCallee());
 
       llvmCall = createLLVMCall(rewriter, loc, prep.signature, prep.callArgs);
-      CABICallHelper::applySRetAttrIfNeeded(llvmCall, origRetTy, prep.usesSRet,
-                                            rewriter);
-      cabi.applyByvalAttrsToCall(llvmCall, prep.argClass,
-                                 adaptor.getArguments().getTypes(),
-                                 prep.usesSRet, rewriter);
-      // A tail call is only safe when the callee and the caller's return ABIs
-      // match. If the callee changed to using an sret "out pointer" due to the
-      // ABI("C") annotation, that may no longer match the caller's return ABI,
-      // leading to an ABI mismatch. If that's the case, avoid marking this
-      // call as `tail` optimizable.
-      if (!prep.usesSRet)
-        applyTailKind(llvmCall, op.getTailKind());
-
-      // Reverse-coerce the return value and replace the op.
-      if (op.getNumResults() == 0) {
+      if (Value result =
+              cabi.finishCall(llvmCall, prep, op.getTailKind(), loc, rewriter))
+        rewriter.replaceOp(op, result);
+      else
         rewriter.eraseOp(op);
-        return success();
-      }
-      Value rawResult = prep.usesSRet ? Value{} : llvmCall.getResult();
-      Value coerced = cabi.extractReturn(prep.retClass, rawResult, prep.sretPtr,
-                                         origRetTy, loc, rewriter);
-      rewriter.replaceOp(op, coerced);
       return success();
     }
 

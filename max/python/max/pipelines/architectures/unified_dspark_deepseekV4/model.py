@@ -14,12 +14,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
-from max.engine import InferenceSession
+from max.engine import InferenceSession, Model
 from max.graph import Graph
 from max.nn.kv_cache import MultiKVCacheParams
 from max.nn.transformer import ReturnLogits
+from max.pipelines.lib.graph_specs import GraphRole
+from max.pipelines.lib.interfaces.batch_processor import BatchProcessor
 from max.pipelines.lib.pipeline_variants.unified_spec_decode_model import (
     _UnifiedSpecDecodeModelMixin,
 )
@@ -27,6 +29,7 @@ from typing_extensions import override
 
 from ..deepseekV4.model import DeepseekV4Model
 from ..deepseekV4.model_config import DeepseekV4Config
+from .batch_processor import UnifiedDSparkDeepseekV4BatchProcessor
 from .spec_adapters import WINDOW_LEAF
 from .unified_dspark_deepseekV4 import UnifiedDSparkDeepseekV4
 
@@ -42,10 +45,25 @@ class UnifiedDSparkDeepseekV4Model(
     its window leaf, so there is no separate draft cache to size or feed.
     """
 
+    # Declared rather than left to the arch's ``batching=`` binding: under
+    # ``max serve`` the model worker ran the inherited base batch processor.
+    batch_processor_cls: ClassVar[type[BatchProcessor[Any, Any]] | None] = (
+        UnifiedDSparkDeepseekV4BatchProcessor
+    )
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # The accept reads the target's logits at every merged position.
         kwargs["return_logits"] = ReturnLogits.VARIABLE
         super().__init__(*args, **kwargs)
+
+    @override
+    def load_graphs(self, session: InferenceSession) -> dict[str, Model]:
+        """Loads the fused graph as the decoder.
+
+        The base registers DeepSeek-V4's own graph through graph specs; this
+        graph still builds through :meth:`load_model`.
+        """
+        return {GraphRole.DECODER: self.load_model(session)}
 
     @override
     def _create_model_config(
@@ -104,6 +122,7 @@ class UnifiedDSparkDeepseekV4Model(
                 max_k=inputs.max_k,
                 top_p=inputs.top_p,
                 min_top_p=inputs.min_top_p,
+                draft_probs_full=inputs.draft_probs_full,
                 signal_buffers=inputs.signal_buffers,
                 pinned_bitmask=inputs.pinned_bitmask,
                 wait_payload=inputs.wait_payload,

@@ -13,17 +13,14 @@
 
 from std.os import abort
 from std.pathlib import Path
-from std.sys import (
-    has_accelerator,
-    has_amd_gpu_accelerator,
-    has_nvidia_gpu_accelerator,
-    size_of,
-)
+from std.sys import size_of
 from std.ffi import _get_dylib_function as _ffi_get_dylib_function
 from std.ffi import CStringSpan, _Global, OwnedDLHandle, _try_find_dylib
 from std.sys.defines import get_defined_int
 
 from std.utils.variant import Variant
+
+from ..host import default_accelerator
 
 # ===-----------------------------------------------------------------------===#
 # Library Load
@@ -39,7 +36,7 @@ comptime ROCTX_LIBRARY_PATHS: List[Path] = [
     "/opt/rocm/lib/librocprofiler-sdk-roctx.so",
 ]
 
-comptime LIBRARY_PATHS = CUDA_NVTX_LIBRARY_PATHS if has_nvidia_gpu_accelerator() else ROCTX_LIBRARY_PATHS
+comptime LIBRARY_PATHS = CUDA_NVTX_LIBRARY_PATHS if default_accelerator().is_nvidia_gpu() else ROCTX_LIBRARY_PATHS
 
 
 comptime _TraceType_OTHER = 0
@@ -96,7 +93,7 @@ def _init_dylib() -> OwnedDLHandle:
             materialize[LIBRARY_PATHS]()
         )
 
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             _setup_categories(
                 dylib._handle.get_function[
                     def(UInt32, CStringSpan[_]) thin abi("C") -> NoneType
@@ -149,25 +146,26 @@ struct Color(Intable, TrivialRegisterPassable):
         Args:
             colorname: The name of the color to use.
         """
-        if colorname == "modular_purple":
-            self = Color.MODULAR_PURPLE
-        elif colorname == "blue":
-            self = Color.BLUE
-        elif colorname == "green":
-            self = Color.GREEN
-        elif colorname == "orange":
-            self = Color.ORANGE
-        elif colorname == "purple":
-            self = Color.PURPLE
-        elif colorname == "red":
-            self = Color.RED
-        elif colorname == "white":
-            self = Color.WHITE
-        elif colorname == "yellow":
-            self = Color.YELLOW
-        else:
-            # Default to MODULAR_PURPLE for unknown color names
-            self = Color.MODULAR_PURPLE
+        match colorname:
+            case "modular_purple":
+                self = Color.MODULAR_PURPLE
+            case "blue":
+                self = Color.BLUE
+            case "green":
+                self = Color.GREEN
+            case "orange":
+                self = Color.ORANGE
+            case "purple":
+                self = Color.PURPLE
+            case "red":
+                self = Color.RED
+            case "white":
+                self = Color.WHITE
+            case "yellow":
+                self = Color.YELLOW
+            case _:
+                # Default to MODULAR_PURPLE for unknown color names
+                self = Color.MODULAR_PURPLE
 
     def __int__(self) -> Int:
         return self._value
@@ -238,8 +236,8 @@ struct EventAttributes[message_origin: ImmOrigin](TrivialRegisterPassable):
     ):
         comptime ASCII = 1
         var resolved_color: Color
-        if color:
-            resolved_color = color.value()
+        if case .Some(color) = color:
+            resolved_color = color
         else:
             resolved_color = color_from_category(category)
         self._value = _C_EventAttributes(
@@ -337,18 +335,18 @@ struct _Mark:
     var _fn: Variant[_nvtxMarkEx.fn_type, _roctxMarkA.fn_type]
 
     def __init__(out self) raises:
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             self._fn = _nvtxMarkEx.load()
         else:
             self._fn = _roctxMarkA.load()
 
     def __call__(self, val: _C_EventAttributes[_]):
-        comptime assert has_nvidia_gpu_accelerator()
+        comptime assert default_accelerator().is_nvidia_gpu()
         var attrs = c_event_attrs_ffi(val)
         self._fn[_nvtxMarkEx.fn_type](Pointer(to=attrs).as_unsafe_any_origin())
 
     def __call__(self, val: CStringSpan[_]):
-        comptime assert has_amd_gpu_accelerator()
+        comptime assert default_accelerator().is_amd_gpu()
         self._fn[_roctxMarkA.fn_type](val.as_unsafe_any_origin())
 
 
@@ -356,7 +354,7 @@ struct _RangeStart:
     var _fn: Variant[_nvtxRangeStartEx.fn_type, _roctxRangeStartA.fn_type]
 
     def __init__(out self) raises:
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             self._fn = _nvtxRangeStartEx.load()
         else:
             self._fn = _roctxRangeStartA.load()
@@ -365,14 +363,14 @@ struct _RangeStart:
         self,
         val: _C_EventAttributes[_],
     ) -> RangeID:
-        comptime assert has_nvidia_gpu_accelerator()
+        comptime assert default_accelerator().is_nvidia_gpu()
         var attrs = c_event_attrs_ffi(val)
         return self._fn[_nvtxRangeStartEx.fn_type](
             Pointer(to=attrs).as_unsafe_any_origin()
         )
 
     def __call__(self, val: CStringSpan[_]) -> RangeID:
-        comptime assert has_amd_gpu_accelerator()
+        comptime assert default_accelerator().is_amd_gpu()
         return self._fn[_roctxRangeStartA.fn_type](val.as_unsafe_any_origin())
 
 
@@ -380,7 +378,7 @@ struct _RangeEnd:
     var _fn: def(RangeID) thin -> NoneType
 
     def __init__(out self) raises:
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             self._fn = _nvtxRangeEnd.load()
         else:
             self._fn = _roctxRangeStop.load()
@@ -393,20 +391,20 @@ struct _RangePush:
     var _fn: Variant[_nvtxRangePushEx.fn_type, _roctxRangePushA.fn_type]
 
     def __init__(out self) raises:
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             self._fn = _nvtxRangePushEx.load()
         else:
             self._fn = _roctxRangePushA.load()
 
     def __call__(self, val: _C_EventAttributes[_]) -> Int32:
-        comptime assert has_nvidia_gpu_accelerator()
+        comptime assert default_accelerator().is_nvidia_gpu()
         var attrs = c_event_attrs_ffi(val)
         return self._fn[_nvtxRangePushEx.fn_type](
             Pointer(to=attrs).as_unsafe_any_origin()
         )
 
     def __call__(self, val: CStringSpan[_]) -> Int32:
-        comptime assert has_amd_gpu_accelerator()
+        comptime assert default_accelerator().is_amd_gpu()
         return self._fn[_roctxRangePushA.fn_type](val.as_unsafe_any_origin())
 
 
@@ -414,7 +412,7 @@ struct _RangePop:
     var _fn: _nvtxRangePop.fn_type
 
     def __init__(out self) raises:
-        comptime if has_nvidia_gpu_accelerator():
+        comptime if default_accelerator().is_nvidia_gpu():
             self._fn = _nvtxRangePop.load()
         else:
             self._fn = _roctxRangePop.load()
@@ -428,15 +426,25 @@ struct _RangePop:
 # ===-----------------------------------------------------------------------===#
 
 
+def _has_annotation_library() -> Bool:
+    # NVTX and roctx are the only backends here. Any other accelerator has no
+    # range API to call, so annotation stays off rather than falling into the
+    # roctx branch and failing its AMD-only assertions at compile time.
+    return (
+        default_accelerator().is_nvidia_gpu()
+        or default_accelerator().is_amd_gpu()
+    )
+
+
 def _is_enabled_details() -> Bool:
     return (
-        has_accelerator()
+        _has_annotation_library()
         and get_defined_int["MODULAR_ENABLE_GPU_PROFILING_DETAILED", 0]() == 1
     )
 
 
 def _is_enabled() -> Bool:
-    return has_accelerator() and (
+    return _has_annotation_library() and (
         get_defined_int["MODULAR_ENABLE_GPU_PROFILING", 0]() == 1
         or _is_enabled_details()
     )
@@ -456,7 +464,7 @@ def _start_range(
     comptime if _is_disabled():
         return 0
 
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         var info = EventAttributes(
             message=message.as_c_string_span(), color=color, category=category
         )
@@ -483,7 +491,7 @@ def _mark(
     comptime if _is_disabled():
         return
 
-    comptime if has_nvidia_gpu_accelerator():
+    comptime if default_accelerator().is_nvidia_gpu():
         var info = EventAttributes(
             message=message.as_c_string_span(), color=color, category=category
         )

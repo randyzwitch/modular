@@ -104,6 +104,11 @@ from pydantic import (
 )
 from typing_extensions import NotRequired, TypedDict
 
+from max.serve.schemas._chat_template import (
+    thinking_requested,
+    with_thinking,
+)
+
 # ---------------------------------------------------------------------------
 # Response models.
 #
@@ -331,12 +336,12 @@ def _model_from_typeddict(name: str, td: type) -> type[BaseModel]:
     """Builds a pydantic ``BaseModel`` mirroring an OpenAI ``TypedDict``.
 
     All fields default to ``None`` because OpenAI marks only a few fields
-    (e.g. ``model``, ``messages``, ``input``) as ``Required[...]``; we
+    (such as ``model``, ``messages``, ``input``) as ``Required[...]``; we
     re-declare the truly required ones in the subclass below with no
     default.
 
     Field annotations are widened to ``Optional[T]`` so that clients which
-    explicitly serialize unset fields as ``null`` (e.g. ``"tool_choice":
+    explicitly serialize unset fields as ``null`` (such as ``"tool_choice":
     null``) are accepted as equivalent to omission. OpenAI expresses this
     via ``NotRequired`` on the TypedDict, but the underlying type aliases
     (``ChatCompletionToolChoiceOptionParam`` and friends) are not
@@ -352,6 +357,14 @@ def _model_from_typeddict(name: str, td: type) -> type[BaseModel]:
     return create_model(name, __config__=_FORBID_EXTRA, **fields)
 
 
+# The OpenAI SDK literal stops at ``xhigh``; GLM and MiniMax-M3.1 name the rung
+# above it ``max``. Matches sglang's ``ReasoningEffortTier``, so a value the
+# reference stack rejects is rejected here too.
+ReasoningEffortLevel = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+]
+
+
 class ReasoningConfig(BaseModel):
     """OpenRouter's ``reasoning`` object (OpenAI only has ``reasoning_effort``).
 
@@ -362,7 +375,7 @@ class ReasoningConfig(BaseModel):
     model_config = _FORBID_EXTRA
 
     enabled: bool | None = None
-    effort: str | None = None
+    effort: ReasoningEffortLevel | None = None
     max_tokens: int | None = None
     exclude: bool | None = None
 
@@ -383,8 +396,10 @@ class _MaxRequestExtensions(BaseModel):
     repetition_penalty: float | None = None
     thinking_temperature: float | None = None
 
-    # MiniMax M3 only: ``False`` folds reasoning into ``content`` wrapped in
-    # ``<think>...</think>``; ``True`` (default) keeps it in the ``reasoning`` field.
+    # ``False`` on chat completions (MiniMax M3 only) folds reasoning into
+    # ``content`` wrapped in ``<think>...</think>``; on completions it skips the
+    # reasoning parser, so ``text`` and ``logprobs`` cover every generated
+    # token. ``True`` (default) keeps reasoning out of ``content``/``text``.
     reasoning_split: bool = True
 
     # Generation control.
@@ -406,7 +421,8 @@ class _MaxRequestExtensions(BaseModel):
             "entries from other requests. Combined with "
             "kv_cache_hash_seed via XOR. Works under any "
             "kv_cache_hash_algo: a cryptographic guarantee under "
-            "sha256/sha256_64, best-effort under ahash64."
+            "sha256 (64-bit key separation on the dKV external tier), "
+            "best-effort under ahash64."
         ),
     )
 
@@ -465,6 +481,9 @@ class CreateChatCompletionRequest(
     # ``stream`` lives on the OpenAI streaming/non-streaming subclasses, not
     # on ``CompletionCreateParamsBase`` - declare it explicitly here.
     stream: bool | None = False
+
+    # Re-typed from the SDK literal to accept ``max``.
+    reasoning_effort: ReasoningEffortLevel | None = None
 
     # MAX-only chat-template extension.
     chat_template_kwargs: dict[str, Any] | None = None
@@ -555,12 +574,10 @@ class CreateChatCompletionRequest(
 
         # Client may set either spelling of the thinking toggle, here we merge
         # both.
-        for key in ("enable_thinking", "thinking"):
-            if key in kwargs:
-                enable_thinking = bool(kwargs[key])
-                break
-        kwargs["enable_thinking"] = enable_thinking
-        kwargs["thinking"] = enable_thinking
+        requested = thinking_requested(kwargs)
+        if requested is not None:
+            enable_thinking = requested
+        kwargs = with_thinking(kwargs, enable_thinking)
         if effort is not None:
             kwargs["reasoning_effort"] = effort
         return kwargs

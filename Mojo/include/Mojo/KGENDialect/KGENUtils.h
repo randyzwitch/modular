@@ -101,10 +101,25 @@ bool isTypeExprType(Type type);
 /// Returns whether the given attribute is a KGEN type expression.
 bool isTypeExpr(TypedAttr attr);
 
+/// If `prop` is an `identical` of any arity, return its operands.
+/// Unlike `getIdentityProposition`, this includes classes wider than two.
+std::optional<ArrayRef<TypedAttr>> getIdentityClass(TypedAttr prop);
+
 /// If `prop` is a binary `#kgen.param.identical` -- so that a consumer may
 /// substitute either operand for the other -- return the pair.
+/// n-ary `identical` wider than two is dropped; use `getIdentityClass`.
 std::optional<std::pair<TypedAttr, TypedAttr>>
 getIdentityProposition(TypedAttr prop);
+
+/// Folds the scalar-bool conjunction of `conjuncts`, which need not be
+/// canonical and may contain nested ANDs. Returns True, False, the single
+/// surviving clause (e.g. a merged `identical` class), or a sorted AND of the
+/// surviving clauses.
+///
+/// Ordinary code builds a conjunction with `ParamOperatorAttr::get(POC::And,
+/// ...)`, which already folds through this; the direct callers are attribute
+/// construction and the proposition fold.
+TypedAttr foldBoolConjunction(ArrayRef<TypedAttr> conjuncts, Type boolType);
 
 /// Gets the common Modular environment attribute (also known as `-D` defines)
 /// for the given compilation context. This includes things like
@@ -440,6 +455,10 @@ void printOptionalInline(AsmPrinter &p, Attribute attr);
 /// This is a temporary helper utility during the Int->SIMD unification project.
 /// After it's done, we should remove the IntegerAttr case.
 ErrorOr<int64_t> getScalarIndexValue(TypedAttr value);
+
+/// Get the value of a scalar parameter value of any integer dtype, including
+/// IntegerAttr. As above, we should drop support for IntegerAttr.
+ErrorOr<int64_t> getScalarIntegerValue(TypedAttr value);
 
 /// The integer `spec` holds, in either the plain or the `InlineLevel` form.
 std::optional<int64_t> inlineLevelValueOf(TypedAttr spec);

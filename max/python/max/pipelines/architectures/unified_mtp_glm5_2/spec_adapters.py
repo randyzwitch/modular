@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from max.graph import BufferType, DimLike, TensorType, TensorValue
+from max.nn.kv_cache import KVCacheParams, MultiKVCacheParams
 from max.nn.transformer import ReturnHiddenStates, ReturnLogits
 from max.nn.transformer.distributed_transformer import forward_sharded_layers
 from max.pipelines.speculative.driver import (
@@ -31,6 +32,7 @@ from max.pipelines.speculative.driver import (
 from max.pipelines.speculative.spec_target import Verified
 
 from ..deepseekV3_2.deepseekV3_2 import DeepseekV3_2
+from ..deepseekV3_2.layers.sparse_mla import sparse_selection_width
 from ..deepseekV3_2_nextn.deepseekV3_2_nextn import DeepseekV3_2NextN
 
 __all__ = [
@@ -95,12 +97,17 @@ class Glm5_2MTPProposer:
     carry_dim_names = CarryDimNames(prefix="mtp_step", per_device=True)
     step_hidden_mode = ReturnHiddenStates.LAST_PER_DEVICE
     uses_thinking_phase = True
+    supports_zero_draft_rows = False
 
     def __init__(self, draft: DeepseekV3_2NextN) -> None:
         self.draft = draft
         self.hidden_dim: DimLike = draft.config.hidden_size
+        assert isinstance(draft.config.kv_params, MultiKVCacheParams)
+        mla_kv_params = draft.config.kv_params.children["mla"]
+        assert isinstance(mla_kv_params, KVCacheParams)
         self.reuse: ReuseSpec | None = ReuseSpec(
-            dim=draft.config.index_topk, split_prefix="mtp_topk"
+            dim=sparse_selection_width(mla_kv_params, draft.config.index_topk),
+            split_prefix="mtp_topk",
         )
 
     def prefill(
@@ -165,6 +172,9 @@ class Glm5_2MTPProposer:
             batch.ep_inputs,
             prev_topk_indices=draft_input.reuse,
             reuse_prev_topk=True,
+            # Every step reuses step 0's selection, made for the token one
+            # position before step 1's.
+            selection_lag=index,
             split_prefix=f"{self.split_prefix}_draft_step{index}",
         )
         return Proposed(

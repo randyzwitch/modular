@@ -11,13 +11,19 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
-from std._plugin.selector import PluginSelector
+from std.sys import CompilationTarget
 
-from ._trait import DefaultMaxPlugin, MaxPluginHooks
+from std._plugin.selector import PluginSelector
+from std._gpu.host.info import TargetAcceleratorCollection
+
+from std._gpu.host._builtin_targets import BuiltinTargets
+from std._plugin.metal import MetalTargets
+
+
+from ._trait import DefaultMaxPlugin
 from .cuda import CudaMaxPlugin
 from .hip import HipMaxPlugin
 from .metal import MetalMaxPlugin
-
 
 comptime MAX_PLUGINS = PluginSelector[
     DefaultMaxPlugin,
@@ -25,3 +31,9 @@ comptime MAX_PLUGINS = PluginSelector[
     CudaMaxPlugin,
     HipMaxPlugin,
 ]
+
+comptime TARGETS = TypeList.of[
+    Trait=TargetAcceleratorCollection,
+    BuiltinTargets,
+    MetalTargets,
+]()

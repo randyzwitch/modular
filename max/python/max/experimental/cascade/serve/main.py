@@ -50,6 +50,7 @@ from typing import Annotated
 
 import cyclopts
 from cyclopts import Parameter
+from max.experimental.cascade.core.fd_limits import raise_nofile_soft_limit
 from max.experimental.cascade.deployment.context_config import ContextConfig
 from max.experimental.cascade.pipelines.all_pipelines import (
     build_pipeline,
@@ -57,6 +58,7 @@ from max.experimental.cascade.pipelines.all_pipelines import (
 )
 from max.experimental.cascade.serve.all_routes import build_router
 from max.experimental.cascade.serve.cascade_fastapi import CascadeFastAPI
+from max.experimental.cascade.telemetry import configure_telemetry
 from max.pipelines.lib import PipelineArgs
 
 logger = logging.getLogger(__name__)
@@ -101,6 +103,8 @@ async def serve(
         host: Interface to bind uvicorn to.
         port: TCP port to bind uvicorn to.
     """
+    raise_nofile_soft_limit()
+
     # Size the GPU worker pool from the model arguments unless the user
     # set it explicitly.
     if context_config.local_gpu_workers == 0:
@@ -109,6 +113,10 @@ async def serve(
         context_config = context_config.model_copy(
             update={"local_gpu_workers": n_gpu_workers}
         )
+
+    # Before any worker subprocess inherits the environment: the OTLP
+    # exporters read the endpoint from it themselves, in every process.
+    context_config.export_otlp_endpoint()
 
     logger.info("Building cascade pipeline ...")
     pipeline = await build_pipeline(pipeline_args)
@@ -127,5 +135,6 @@ async def serve(
                 pipeline_args.runtime.emit_reasoning_content,
             )
         )
+        configure_telemetry("cascade.frontend", f"{host}:{port}")
 
         await app.serve(host, port)

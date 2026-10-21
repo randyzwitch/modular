@@ -96,7 +96,12 @@ def make_manager(
         pools=pools,
         block_size=BLOCK_SIZE,
         enable_prefix_caching=enable_prefix_caching,
-        groups=create_groups(LEAVES, pools, BLOCK_SIZE),
+        groups=create_groups(
+            LEAVES,
+            pools,
+            BLOCK_SIZE,
+            enable_prefix_caching=enable_prefix_caching,
+        ),
         leaves=leaf_regions(),
     )
 
@@ -235,7 +240,7 @@ def test_the_ring_is_never_published() -> None:
     for _ in range(4):
         forward(bm, ctx)
 
-    assert bm.pools[0].prefix_caches[RING] == {}
+    assert not bm.pools[0].prefix_caches[RING]
     assert bm.pools[0].prefix_caches[FULL], (
         "the paged leaf has to publish for this to mean anything"
     )
@@ -289,7 +294,10 @@ def test_the_ring_block_is_counted_before_a_request_is_admitted() -> None:
     # than being a carve-out beside it.
     bm = make_manager()
 
-    assert leaf_regions()[RING].blocks_to_reserve(99) == 1
+    assert (
+        leaf_regions()[RING].blocks_to_reserve(99, enable_prefix_caching=True)
+        == 1
+    )
     assert bm._blocks_to_reserve(16)[RING] == 1
 
 
@@ -352,10 +360,11 @@ def test_the_region_flag_is_what_puts_the_leaf_in_the_scratch_group() -> None:
 
     assert isinstance(leaves[RING], ScratchKVLeafRegion)
     assert leaves[RING].group_id == KVCacheGroupId.scratch()
-    assert leaves[RING].blocks_to_reserve(99) == 1
+    assert leaves[RING].blocks_to_reserve(99, enable_prefix_caching=True) == 1
     assert isinstance(leaves[REC], RecurrentKVLeafRegion)
     assert leaves[REC].group_id == KVCacheGroupId.recurrent()
-    assert leaves[REC].blocks_to_reserve(99) == 2
+    assert leaves[REC].blocks_to_reserve(99, enable_prefix_caching=True) == 2
+    assert leaves[REC].blocks_to_reserve(99, enable_prefix_caching=False) == 1
 
 
 def test_a_scratch_region_still_declares_its_pool_and_row_table() -> None:

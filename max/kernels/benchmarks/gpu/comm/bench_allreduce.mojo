@@ -32,7 +32,7 @@ from max.benchmark import (
     bench_multicontext,
     bencher_iter_custom,
 )
-from layout import Idx, TileTensor, row_major
+from layout import TileTensor, row_major
 from comm.sync import enable_p2p, init_signal_buffer
 from comm.allreduce import allreduce
 from comm import Signal
@@ -56,7 +56,6 @@ from std.utils.index import StaticTuple
 
 
 @inline(.always)
-@__parameter
 def _per_gpu_value[
     dtype: DType,
 ](gpu_rank: Int, j: Int) -> Scalar[dtype]:
@@ -244,8 +243,9 @@ def bench_reduce[
                 # multi_ptr is set when use_multimem == True
                 in_tensors[0] = TileTensor(
                     rebind[ImmPointer[Scalar[dtype], ImmutAnyOrigin]](
-                        multi_ptr.unsafe_value()
-                        + cb_template.offset(cache_iter)
+                        multi_ptr.unsafe_value().unsafe_offset(
+                            cb_template.offset(cache_iter)
+                        )
                     ),
                     row_major(length),
                 )

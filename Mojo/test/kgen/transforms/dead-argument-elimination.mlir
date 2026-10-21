@@ -130,3 +130,47 @@ kgen.func @calls_external(%dead_arg: index, %live_arg: index) -> index {
   %0 = kgen.call @external_callee(%live_arg) : (index) -> index
   hlcf.return %0: index
 }
+
+// -----
+
+// COM: Each surviving argument keeps its own entry, not a neighbour's. The
+// COM: dead arguments bracket the live ones, so the survivors are entries 1
+// COM: and 3 and any off-by-one picks up a `{}`.
+// CHECK-LABEL: kgen.func @arg_metadata_follows_live_args(%arg0: index, %arg1: index) -> index
+// CHECK-SAME: fnArgAttrs = [{llvm.noalias}, {nvvm.grid_constant}]
+kgen.func @arg_metadata_follows_live_args(
+  %dead_first: !kgen.scalar<f32>,
+  %live_first: index,
+  %dead_last: !kgen.scalar<f32>,
+  %live_last: index
+) -> index attributes {
+  fnArgAttrs = [{}, {llvm.noalias = unit}, {}, {nvvm.grid_constant = unit}]
+} {
+  %0 = index.add %live_first, %live_last
+  hlcf.return %0: index
+}
+
+// CHECK-LABEL: kgen.func export @calls_arg_metadata_follows_live_args
+kgen.func export @calls_arg_metadata_follows_live_args(%arg: index) -> index {
+  %0 = kgen.call @arg_metadata_follows_live_args(%arg, %arg, %arg, %arg) : (index, index, index, index) -> index
+  hlcf.return %0: index
+}
+
+// -----
+
+// COM: A dead argument that flows only into pure ops whose final result is
+// COM: dead (never used) must not crash the pass. The value is not provably
+// COM: live, so the argument and the dead pure op are removed.
+// CHECK-LABEL: kgen.func @dead_end_pure_chain() -> index
+kgen.func @dead_end_pure_chain(%dead_arg: index) -> index {
+  %0 = index.add %dead_arg, %dead_arg
+  %1 = index.constant 0
+  hlcf.return %1: index
+}
+
+// CHECK-LABEL: kgen.func export @calls_dead_end_pure_chain
+kgen.func export @calls_dead_end_pure_chain(%arg: index) -> index {
+  // CHECK: kgen.call @dead_end_pure_chain() : () -> index
+  %0 = kgen.call @dead_end_pure_chain(%arg) : (index) -> index
+  hlcf.return %0: index
+}

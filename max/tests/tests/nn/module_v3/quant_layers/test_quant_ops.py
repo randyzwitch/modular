@@ -28,16 +28,16 @@ import pytest
 from max.driver import CPU
 from max.dtype import DType
 from max.experimental import functional as F
-from max.experimental.tensor import Tensor
-from max.graph import TensorValue
-from max.nn.comm.ep import EPConfig
-from max.nn.quant_config import QuantConfig, QuantFormat
-from max.pipelines.architectures.deepseekV3_modulev3.layers import quant_ops
-from max.pipelines.architectures.deepseekV3_modulev3.layers.quant_tensor import (
+from max.experimental.nn.common_layers import quant_ops
+from max.experimental.nn.common_layers.quant_tensor import (
     FP8BlockTensor,
     NVFP4Activation,
     NVFP4Tensor,
+    NVFP4TensorQuantizer,
 )
+from max.experimental.tensor import Tensor, default_dtype
+from max.nn.comm.ep import EPConfig
+from max.nn.quant_config import QuantConfig, QuantFormat
 
 _HIDDEN_DIM = 256
 _MOE_DIM = 128
@@ -68,6 +68,18 @@ def test_predicates_separate_fp8_from_nvfp4(
     assert quant_ops.is_nvfp4_quantized(nvfp4_quant_config)
     assert not quant_ops.is_nvfp4_quantized(fp8_quant_config)
     assert not quant_ops.is_nvfp4_quantized(None)
+
+
+def test_fake_quant_is_not_checkpoint_nvfp4(
+    nvfp4_quant_config: QuantConfig, nvfp4_fake_quant_config: QuantConfig
+) -> None:
+    """Runtime NVFP4 quantization is a separate format from packed checkpoints."""
+    assert quant_ops.is_nvfp4_fake_quantized(nvfp4_fake_quant_config)
+    assert not quant_ops.is_nvfp4_fake_quantized(nvfp4_quant_config)
+    assert not quant_ops.is_nvfp4_fake_quantized(None)
+
+    assert not quant_ops.is_nvfp4_quantized(nvfp4_fake_quant_config)
+    assert quant_ops.is_nvfp4_quantized(nvfp4_quant_config)
 
 
 def test_only_nvfp4_needs_dispatch_scales_and_offsets(
@@ -119,6 +131,23 @@ def test_quantized_weight_dispatch_by_format(
             ),
             NVFP4Tensor,
         )
+
+
+def test_quantized_weight_nvfp4_fake(
+    nvfp4_fake_quant_config: QuantConfig,
+) -> None:
+    """Fake-quant NVFP4 wraps the logical bf16 weight instead of packed leaves."""
+    # The default dtype is float32 on a CPU host and bfloat16 on a GPU one;
+    # models build under bfloat16.
+    with F.lazy(), default_dtype(DType.bfloat16):
+        weight = quant_ops.quantized_weight(
+            _MOE_DIM, _HIDDEN_DIM, nvfp4_fake_quant_config
+        )
+
+        assert isinstance(weight, NVFP4TensorQuantizer)
+        assert weight.block_size == (1, 16)
+        assert list(weight.shape) == [_MOE_DIM, _HIDDEN_DIM]
+        assert weight._tensor.dtype == DType.bfloat16
 
 
 def test_quantized_weight_rejects_unsupported_format(
@@ -259,16 +288,16 @@ def _ep_config(
     )
 
 
-def _value(shape: list[int], dtype: DType) -> TensorValue:
-    return TensorValue(Tensor.zeros(shape, dtype=dtype, device=CPU()))
+def _value(shape: list[int], dtype: DType) -> Tensor:
+    return Tensor.zeros(shape, dtype=dtype, device=CPU())
 
 
-def _metadata() -> TensorValue:
+def _metadata() -> Tensor:
     """The host grouped-matmul metadata tuple element ``[max_m, n_active]``."""
-    return TensorValue(Tensor.zeros([2], dtype=DType.uint32, device=CPU()))
+    return Tensor.zeros([2], dtype=DType.uint32, device=CPU())
 
 
-def _bf16_dispatch() -> list[tuple[TensorValue, ...]]:
+def _bf16_dispatch() -> list[tuple[Tensor, ...]]:
     return [
         (
             _value([_TOKENS, _HIDDEN_DIM], DType.bfloat16),
@@ -280,7 +309,7 @@ def _bf16_dispatch() -> list[tuple[TensorValue, ...]]:
     ]
 
 
-def _fp8_dispatch() -> list[tuple[TensorValue, ...]]:
+def _fp8_dispatch() -> list[tuple[Tensor, ...]]:
     return [
         (
             _value([_TOKENS, _HIDDEN_DIM], DType.float8_e4m3fn),
@@ -293,7 +322,7 @@ def _fp8_dispatch() -> list[tuple[TensorValue, ...]]:
     ]
 
 
-def _nvfp4_dispatch() -> list[tuple[TensorValue, ...]]:
+def _nvfp4_dispatch() -> list[tuple[Tensor, ...]]:
     """The six NVFP4 dispatch outputs (see ``_ep_dispatch_output_types``)."""
     return [
         (
@@ -325,7 +354,7 @@ def test_payload_bf16_has_no_scales() -> None:
         # The bf16 grouped matmul reads num_active_experts off the host.
         assert payload.usage_stats[0].device.is_host
 
-        assert payload.local_map_tokens(None) == payload.tokens
+        assert payload.per_device_tokens(None) == payload.tokens
 
 
 def test_payload_fp8_carries_activation_scales(
@@ -342,7 +371,7 @@ def test_payload_fp8_carries_activation_scales(
         assert payload.scales_offset is None
         assert payload.usage_stats is not None
 
-        tokens = payload.local_map_tokens(fp8_quant_config)
+        tokens = payload.per_device_tokens(fp8_quant_config)
         assert len(tokens) == 2
         first = tokens[0]
         assert isinstance(first, FP8BlockTensor)
@@ -369,7 +398,7 @@ def test_payload_nvfp4_carries_scales_and_offsets(
         assert payload.usage_stats is None
 
         global_scale = Tensor.zeros((), dtype=DType.float32, device=CPU())
-        tokens = payload.local_map_tokens(
+        tokens = payload.per_device_tokens(
             nvfp4_quant_config, nvfp4_global_scale=global_scale
         )
         assert len(tokens) == 2
@@ -392,4 +421,4 @@ def test_payload_nvfp4_tokens_require_the_uniform_scale(
         )
 
         with pytest.raises(AssertionError, match="uniform scale"):
-            payload.local_map_tokens(nvfp4_quant_config)
+            payload.per_device_tokens(nvfp4_quant_config)

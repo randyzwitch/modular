@@ -425,7 +425,7 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
     config.parserListener = &lspListener;
 
     MojoParserContext parserContext(mgr, config);
-    MojoASTDeclRef decl = parserContext.parseFileForLSP(mgr.getMainFileID());
+    LIT::ASTDecl *decl = parserContext.parseFileForLSP(mgr.getMainFileID());
     if (!decl)
       return failure(clOptions.reportError("could not parse the module"));
 
@@ -865,6 +865,8 @@ int main(int argc, char **argv) {
   registerAsmPrinterCLOptions();
   registerDefaultTimingManagerCLOptions();
   KGEN::registerDefaultKGENPasses("kgen");
+  // Passes contributed by whichever backend plugins this build links.
+  KGEN::TargetTraitsRegistry::get().registerAllPasses();
   registerPassManagerCLOptions();
   KGEN::initializeDebugOptions();
   KGEN::KGENPassCLOptions::registerOptions();

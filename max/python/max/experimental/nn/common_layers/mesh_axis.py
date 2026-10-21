@@ -13,15 +13,14 @@
 
 """Device mesh axis names to use with specific type of parallelisms.
 
-Used by layers in :mod:`max.experimental.nn.common_layers` to tag weight tensors
-with device placements.
-
-The placements are used to automatically shard the weights when
-Module.to(DeviceMesh(...)) is called, as long as the mesh has the appropriate
-axis name(s).
+Used by layers in :mod:`max.experimental.nn.common_layers` to place weight
+tensors in the mesh (set by :func:`~max.experimental.tensor.default_device`).
 """
 
-TP = "tp"  # Tensor parallelism.
-DP = "dp"  # Data parallelism.
+#: Mesh axis name for tensor parallelism.
+TP = "tp"
+
+#: Mesh axis name for data parallelism.
+DP = "dp"
 
 __all__ = ["DP", "TP"]

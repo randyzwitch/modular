@@ -24,6 +24,8 @@ from max.pipelines.lib.interfaces.batch_processor import (
     UnifiedSpecDecodeBatchProcessor,
 )
 
+from ..deepseekV4.model_config import DeepseekV4Config
+
 __all__ = [
     "UnifiedDSparkDeepseekV4BatchProcessor",
     "UnifiedDSparkDeepseekV4Inputs",
@@ -49,11 +51,14 @@ class UnifiedDSparkDeepseekV4Inputs(UnifiedSpecDecodeInputs):
             self.return_n_logits,
             *self.signal_buffers,
             *tree.leaves(self.kv_cache_inputs),
-        ) + self._spec_decode_tail_buffers(include_in_thinking_phase=False)
+            *self._spec_decode_tail_buffers(include_in_thinking_phase=False),
+        )
 
 
 class UnifiedDSparkDeepseekV4BatchProcessor(
-    UnifiedSpecDecodeBatchProcessor[UnifiedDSparkDeepseekV4Inputs]
+    UnifiedSpecDecodeBatchProcessor[
+        UnifiedDSparkDeepseekV4Inputs, DeepseekV4Config
+    ]
 ):
     """Ragged batching with the spec-decode seed."""
 

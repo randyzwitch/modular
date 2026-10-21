@@ -17,6 +17,7 @@ from unittest import mock
 import pytest
 from max.serve.config import Settings
 from max.serve.telemetry import common, metrics
+from max.support._telemetry import drop_metrics_matching
 from opentelemetry.metrics import get_meter_provider
 from opentelemetry.metrics._internal.instrument import (
     _ProxyGauge,
@@ -164,6 +165,34 @@ def test_tokens_per_request_histograms() -> None:
     # Test recording output tokens per request
     m_output = metrics.MaxMeasurement("maxserve.output_tokens_per_request", 128)
     m_output.commit()  # Should not raise
+
+
+@pytest.mark.parametrize(
+    "method", ["input_tokens_per_request", "output_tokens_per_request"]
+)
+@pytest.mark.parametrize(
+    ("turn", "expected_attributes"),
+    [
+        pytest.param(None, {"model": "m"}, id="no_turn"),
+        pytest.param("first", {"model": "m", "turn": "first"}, id="first"),
+        pytest.param("later", {"model": "m", "turn": "later"}, id="later"),
+    ],
+)
+def test_tokens_per_request_carry_the_turn_when_given(
+    method: str,
+    turn: metrics.ConversationTurn | None,
+    expected_attributes: dict[str, str],
+) -> None:
+    client = mock.Mock()
+    async_metrics = metrics._AsyncMetrics()
+    async_metrics.configure(client, extra_attributes={"model": "m"})
+
+    getattr(async_metrics, method)(7, turn)
+
+    measurement = client.send_measurement.call_args.args[0]
+    assert measurement.value == 7
+    assert measurement.attributes == expected_attributes
+    assert async_metrics.extra_attributes == {"model": "m"}
 
 
 def _is_histogram(inst: object) -> bool:
@@ -358,7 +387,7 @@ def _synthetic_metrics_data(
 ) -> MetricsData:
     """Builds a minimal MetricsData tree wrapping the given data payloads.
 
-    Exercises common._drop_metrics_matching (shared by both reader guards)
+    Exercises drop_metrics_matching (shared by both reader guards)
     directly, without needing a real MeterProvider/exporter -- these are
     frozen dataclasses, cheap to construct by hand.
     """
@@ -454,8 +483,8 @@ def _metric_data_types(filtered: MetricsData | None) -> list[type]:
 
 
 def test_drop_metrics_matching_keeps_and_drops_by_data_type() -> None:
-    """common._drop_metrics_matching is the shared primitive behind both
-    reader guards: _SkipExponentialHistogramsPrometheusReader filters out
+    """drop_metrics_matching is the shared primitive behind both reader
+    guards: SkipExponentialHistogramsPrometheusReader filters out
     ExponentialHistogram data (so Prometheus never sees a shape it can't
     render), and _ExponentialShadowOnlyReader filters out the classic
     Histogram data (so the OTLP endpoint carries only the shadow metric,
@@ -468,8 +497,8 @@ def test_drop_metrics_matching_keeps_and_drops_by_data_type() -> None:
         _exponential_histogram_payload(),
     )
 
-    # Mirrors _SkipExponentialHistogramsPrometheusReader's filter.
-    prometheus_bound = common._drop_metrics_matching(
+    # Mirrors SkipExponentialHistogramsPrometheusReader's filter.
+    prometheus_bound = drop_metrics_matching(
         data, lambda m: isinstance(m.data, ExponentialHistogram)
     )
     assert set(_metric_data_types(prometheus_bound)) == {
@@ -478,7 +507,7 @@ def test_drop_metrics_matching_keeps_and_drops_by_data_type() -> None:
     }
 
     # Mirrors _ExponentialShadowOnlyReader's filter.
-    otlp_bound = common._drop_metrics_matching(
+    otlp_bound = drop_metrics_matching(
         data, lambda m: isinstance(m.data, ExplicitHistogramData)
     )
     assert set(_metric_data_types(otlp_bound)) == {
@@ -489,7 +518,7 @@ def test_drop_metrics_matching_keeps_and_drops_by_data_type() -> None:
     # Neither guard drops everything, and a None input passes through as
     # None (both readers' _receive_metrics skip the export call in that
     # case, matching the base SDK's own no-op-on-None convention).
-    assert common._drop_metrics_matching(None, lambda m: True) is None
+    assert drop_metrics_matching(None, lambda m: True) is None
 
 
 def test_block_level_metrics_are_gauges() -> None:
@@ -514,6 +543,18 @@ def test_disk_byte_counters_record() -> None:
     for name in (
         "maxserve.cache.disk_bytes_read",
         "maxserve.cache.disk_bytes_written",
+    ):
+        assert name in metrics.SERVE_METRICS
+        metrics.MaxMeasurement(name, 7).commit()  # Should not raise
+
+
+def test_connector_refusal_counters_record() -> None:
+    """The connector refusal and failure counters exist and record."""
+    common.configure_metrics(Settings())
+    for name in (
+        "maxserve.cache.connector_loads_refused",
+        "maxserve.cache.connector_load_failures",
+        "maxserve.cache.connector_offload_blocks_dropped",
     ):
         assert name in metrics.SERVE_METRICS
         metrics.MaxMeasurement(name, 7).commit()  # Should not raise
@@ -549,6 +590,40 @@ def test_structured_output_grammar_rejection_counter() -> None:
         metrics.METRICS.structured_output_grammar_rejection(
             kind
         )  # Should not raise
+
+
+def test_client_disconnect_cancellation_counter() -> None:
+    """The disconnect counter records with a bounded 'phase' tag."""
+    common.configure_metrics(Settings())
+    assert (
+        "maxserve.request.client_disconnect_cancellations"
+        in metrics.SERVE_METRICS
+    )
+    for phase in ("before_response", "during_response"):
+        metrics.METRICS.client_disconnect_cancellation(
+            phase
+        )  # Should not raise
+    metrics.METRICS.export_zero_client_disconnect_cancellations()
+
+
+def test_disconnect_phases_are_exported_at_zero() -> None:
+    client = mock.Mock()
+    recorder = metrics._AsyncMetrics()
+    recorder.configure(client, {"model": "m"})
+    recorder.export_zero_client_disconnect_cancellations()
+    sent = [call.args[0] for call in client.send_measurement.call_args_list]
+    assert [(m.instrument_name, m.value, m.attributes) for m in sent] == [
+        (
+            "maxserve.request.client_disconnect_cancellations",
+            0,
+            {"model": "m", "phase": "before_response"},
+        ),
+        (
+            "maxserve.request.client_disconnect_cancellations",
+            0,
+            {"model": "m", "phase": "during_response"},
+        ),
+    ]
 
 
 def test_tool_call_requests_counter() -> None:

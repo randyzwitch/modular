@@ -51,12 +51,9 @@ struct ParameterizedOpaqueType:
     @staticmethod
     def execute[
         P0: Int
-    ](
-        output: OutputTensor[dtype=.int32, rank=1, ...],
-        x: SIMDPair[P0, _],
-    ) capturing:
-        output.store(IndexList[1](0), x.x)
-        output.store(IndexList[1](P0), x.y)
+    ](output: OutputTensor[dtype=.int32, rank=1, ...], x: SIMDPair[P0, _],):
+        output.store((0,), x.x)
+        output.store((P0,), x.y)
 
 
 @extensibility.register_shape_function("kernel_with_parameterized_opaque")
